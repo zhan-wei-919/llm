@@ -1,0 +1,12 @@
+# 编译产物
+*.o
+*.a
+*.so
+
+# 测试目录里的可执行文件(无扩展名), 源码 .cu 保留
+kernel/**/test/*
+!kernel/**/test/*.cu
+
+# clangd 索引缓存
+.cache/
+compile_commands.json

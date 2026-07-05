@@ -1,0 +1,43 @@
+# clangd 配置 —— CUDA 13.3 + clang/clangd 21 + RTX 5060 Ti (sm_120)
+#
+# 说明:
+# - 把 .cu/.cuh 当 CUDA 解析(-x cuda),这样 __global__ / <<<>>> / threadIdx 等不报错。
+# - CUDA 13 比 clang 21 的内置 CUDA 兼容层新,有两处头文件不兼容,这里绕过:
+#     1. -I .clangd-shims  提供被删掉的 texture_fetch_functions.h 空 stub。
+#     2. -D_NV_RSQRT_SPECIFIER  补上 wrapper 跳过 math_functions.h 时缺失的宏。
+# - 这些只影响 clangd 静态解析,不影响 nvcc 真实编译。
+CompileFlags:
+  Compiler: clang++-21
+  Add:
+    - -x
+    - cuda
+    - --cuda-path=/usr/local/cuda
+    - --cuda-gpu-arch=sm_120
+    - -std=c++17
+    - -Wno-unknown-cuda-version
+    - -D_NV_RSQRT_SPECIFIER=noexcept(true)
+    - -I/home/zhanwei/project/GPT2/.clangd-shims
+    - -I/usr/local/cuda/include
+  # 若以后从 nvcc 生成 compile_commands.json,下面这些 nvcc 专属 flag 会让 clangd 报错,提前剔除。
+  Remove:
+    - -forward-unknown-to-host-compiler
+    - -gencode*
+    - --generate-code*
+    - -arch=*
+    - -ccbin*
+    - --expt-*
+    - -rdc=*
+    - --options-file*
+    - -Xcompiler*
+    - -Xcudafe*
+    - --compiler-options*
+
+# clang 在编译 CUDA 时会自动 -include __clang_cuda_runtime_wrapper.h(内含 builtin_vars)。
+# 这些是 clang 内部头、nvcc 并不存在,绝不能手动 include。下面让 include-cleaner 闭嘴:
+# 既不建议补这些头,也不把它们当未使用 include 报警。
+Diagnostics:
+  Includes:
+    IgnoreHeader:
+      - __clang_cuda.*
+      - cuda_runtime.*
+      - cuda_bf16.*

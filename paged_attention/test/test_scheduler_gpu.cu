@@ -56,13 +56,13 @@ static void ref_attn(int id, int p, float *out) {
 int main() {
 	// ---------- 装配: Arena → KV_Pool → Engine → Scheduler ----------
 	int W = (MAX_SEQ_LEN + KV_BLOCK_SIZE - 1) / KV_BLOCK_SIZE;
-	Arena a(8);
-	Tensor *t_table = a.alloc({MAX_SEQS, W},            Dtype::F32);
-	Tensor *t_len   = a.alloc({MAX_SEQS},               Dtype::F32);
-	Tensor *t_pos   = a.alloc({MAX_SEQS},               Dtype::F32);
-	Tensor *t_ids   = a.alloc({MAX_SEQS * MAX_SEQ_LEN}, Dtype::F32);
-	Tensor *t_cu    = a.alloc({MAX_SEQS + 1},           Dtype::F32);
+	int L = W * KV_BLOCK_SIZE;
+	int meta_ints = MAX_SEQS * W + MAX_SEQS + MAX_SEQS + MAX_SEQS * L + (MAX_SEQS + 1);
+	Arena a(4);
+	Tensor *t_meta = a.alloc({meta_ints}, Dtype::F32);
 	a.finalize();
+	int *h_base;
+	cudaHostAlloc(&h_base, meta_ints * sizeof(int), 0);
 	// KV 显存不走 alloc_kv_pool (那会吃满整卡, 永远不会抢占),
 	// 手动只给 12 块, 让调度器的记账和抢占真的被逼出来
 	size_t kv_bytes = (size_t)BLOCKS * KV_BLOCK_SIZE * KS * sizeof(float);
@@ -70,9 +70,7 @@ int main() {
 	cudaMalloc(&k_base, kv_bytes);
 	cudaMalloc(&v_base, kv_bytes);
 	KV_Pool pool(k_base, v_base, Dtype::F32, KS, kv_bytes, MAX_SEQS, MAX_SEQ_LEN);
-	Engine eng(pool, NH, NKV, HS,
-	           (int *)t_table->ptr, (int *)t_len->ptr, (int *)t_pos->ptr,
-	           (int *)t_ids->ptr, (int *)t_cu->ptr);
+	Engine eng(pool, NH, NKV, HS, (int *)t_meta->ptr, h_base);
 	Scheduler sched(pool, {/*max_num_seqs=*/MAX_SEQS, /*max_num_batched_tokens=*/64, /*eos=*/-1});
 
 	// ---------- 造数据 + 入队 ----------
@@ -171,6 +169,7 @@ int main() {
 	printf("\n%d 步, %d 次抢占, 验证 %d 行, max |gpu - ref| = %g  ->  %s\n",
 	       steps, sched.num_preemptions(), verified_rows, max_diff,
 	       max_diff < 1e-4 ? "OK" : "MISMATCH");
+	cudaFreeHost(h_base);
 	cudaFree(k_base); cudaFree(v_base);
 	cudaFree(dq); cudaFree(dk); cudaFree(dv); cudaFree(dout);
 	return max_diff < 1e-4 ? 0 : 1;

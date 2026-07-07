@@ -16,20 +16,17 @@ static float frand() { return (rand() % 200 - 100) / 100.0f; }	// [-1, 1)
 int main() {
 	// ---------- 装配: Arena → KV_Pool → Engine ----------
 	int W = (MAX_SEQ_LEN + KV_BLOCK_SIZE - 1) / KV_BLOCK_SIZE;
-	Arena a(8);
-	// Engine 的 device 工作数组 (内容是 int; Dtype 暂无 I32, 用同为 4 字节的 F32 占位)
-	Tensor *t_table = a.alloc({MAX_SEQS, W},            Dtype::F32);
-	Tensor *t_len   = a.alloc({MAX_SEQS},               Dtype::F32);
-	Tensor *t_pos   = a.alloc({MAX_SEQS},               Dtype::F32);
-	Tensor *t_ids   = a.alloc({MAX_SEQS * MAX_SEQ_LEN}, Dtype::F32);
-	Tensor *t_cu    = a.alloc({MAX_SEQS + 1},           Dtype::F32);
+	int L = W * KV_BLOCK_SIZE;
+	int meta_ints = MAX_SEQS * W + MAX_SEQS + MAX_SEQS + MAX_SEQS * L + (MAX_SEQS + 1);
+	Arena a(4);
+	Tensor *t_meta = a.alloc({meta_ints}, Dtype::F32);
 	a.finalize();
+	int *h_base;
+	cudaHostAlloc(&h_base, meta_ints * sizeof(int), 0);
 	KVAlloc kva = a.alloc_kv_pool(0.05);	// 测试不用吃满整卡
 	KV_Pool pool(kva.k_base, kva.v_base, Dtype::F32, KV_STRIDE, kva.bytes_each,
 	             MAX_SEQS, MAX_SEQ_LEN);
-	Engine eng(pool, NH, NKV, HS,
-	           (int *)t_table->ptr, (int *)t_len->ptr, (int *)t_pos->ptr,
-	           (int *)t_ids->ptr, (int *)t_cu->ptr);
+	Engine eng(pool, NH, NKV, HS, (int *)t_meta->ptr, h_base);
 
 	// ---------- 造数据: 一条序列, prompt 3 行 + decode 1 行, 共 4 行 ----------
 	srand(42);
@@ -92,5 +89,6 @@ int main() {
 	printf("max |gpu - ref| = %g  ->  %s\n", max_diff, max_diff < 1e-4 ? "OK" : "MISMATCH");
 
 	eng.release(slot);
+	cudaFreeHost(h_base);
 	return max_diff < 1e-4 ? 0 : 1;
 }

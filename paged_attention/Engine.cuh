@@ -13,20 +13,31 @@
 // 所以全程不需要显式同步.
 class Engine {
 public:
-	// device 工作数组的尺寸要求 (装配层从 Arena 切好):
-	//   d_table:      [max_seqs, max_blocks_per_seq]
-	//   d_len/d_pos:  [max_seqs]
-	//   d_seq_ids:    [max_seqs * max_seq_len]   (prefill 打包行数的最坏情况)
-	//   d_cu_seqlens: [max_seqs + 1]
-	Engine(KV_Pool &pool, int NH, int NKV, int HS,
-	       int *d_table, int *d_len, int *d_pos, int *d_seq_ids, int *d_cu_seqlens)
-	: pool_(pool), NH_(NH), NKV_(NKV), HS_(HS)
-	, d_table_(d_table), d_len_(d_len), d_pos_(d_pos)
-	, d_seq_ids_(d_seq_ids), d_cu_seqlens_(d_cu_seqlens)
-	, h_table_((size_t)pool.max_seqs() * pool.max_blocks_per_seq())
-	, h_len_(pool.max_seqs()), h_pos_(pool.max_seqs())
-	, h_seq_ids_((size_t)pool.max_seqs() * pool.max_blocks_per_seq() * KV_BLOCK_SIZE)
-	, h_cu_seqlens_(pool.max_seqs() + 1) {}
+	// S = max_seqs
+	// W = max_blocks_per_seq
+	// L = max_seq_len  (= S * W * KV_BLOCK_SIZE 的上界，但实际是 pool 的 max_seq_len)
+	// table:      S * W       个 int
+	// len:        S           个 int
+	// pos:        S           个 int
+	// seq_ids:    S * L       个 int   (最坏情况)
+	// cu_seqlens: S + 1       个 int
+	Engine(KV_Pool &pool, int NH, int NKV, int HS, int *d_base, int *h_base)
+	: pool_(pool), NH_(NH), NKV_(NKV), HS_(HS), d_base_(d_base), h_base_(h_base) {
+		int S = pool.max_seqs();
+		int W = pool.max_blocks_per_seq();
+		int L = pool.max_blocks_per_seq() * KV_BLOCK_SIZE;
+		d_table_	= d_base;	d_base += S * W;	total_ints_ += S * W;
+		d_len_		= d_base;	d_base += S;		total_ints_ += S;
+		d_pos_		= d_base;	d_base += S;		total_ints_ += S;
+		d_seq_ids_	= d_base;	d_base += S * L;	total_ints_ += S * L;
+		d_cu_seqlens_	= d_base;				total_ints_ += S + 1;
+		h_table_	= h_base;	h_base += S * W;
+		h_len_		= h_base;	h_base += S;
+		h_pos_		= h_base;	h_base += S;
+		h_seq_ids_	= h_base;	h_base += S * L;
+		h_cu_seqlens_	= h_base;
+
+	}
 
 	int alloc_seq() { return pool_.alloc_seq(); }
 	void release(int slot) { pool_.release(slot); }
@@ -42,10 +53,10 @@ public:
 			h_cu_seqlens_[b + 1] = h_cu_seqlens_[b] + lens[b];
 		}
 		int total = h_cu_seqlens_[B];
-		pool_.gather_tables(slots, B, h_table_.data(), h_len_.data());
+		pool_.gather_tables(slots, B, h_table_, h_len_);
 		for (int b = 0, t = 0; b < B; ++b)			// 展开: 第 b 段的 lens[b] 行都属于 b
 			for (int i = 0; i < lens[b]; ++i) h_seq_ids_[t++] = b;
-		upload(B, W, total);
+		upload();
 		dtype_dispatch(pool_.dtype(), [&](auto tag) {
 			using T_ = typename decltype(tag)::type;
 			launch_scatter_kv<T_>(
@@ -67,10 +78,10 @@ public:
 		int W = pool_.max_blocks_per_seq();
 		for (int b = 0; b < B; ++b)
 			h_pos_[b] = pool_.append(slots[b], 1);		// 写入起点用旧 len
-		pool_.gather_tables(slots, B, h_table_.data(), h_len_.data());	// 读范围用新 len
+		pool_.gather_tables(slots, B, h_table_, h_len_);	// 读范围用新 len
 		for (int b = 0; b <= B; ++b) h_cu_seqlens_[b] = b;	// decode 打包形态固定: 每序列一行
 		for (int b = 0; b < B; ++b) h_seq_ids_[b] = b;
-		upload(B, W, /*total=*/B);
+		upload();
 		dtype_dispatch(pool_.dtype(), [&](auto tag) {
 			using T_ = typename decltype(tag)::type;
 			launch_scatter_kv<T_>(
@@ -87,20 +98,15 @@ public:
 	}
 
 private:
-	void upload(int B, int W, int total) {
-		cudaMemcpy(d_table_, h_table_.data(), sizeof(int) * B * W, cudaMemcpyHostToDevice);
-		cudaMemcpy(d_len_, h_len_.data(), sizeof(int) * B, cudaMemcpyHostToDevice);
-		cudaMemcpy(d_pos_, h_pos_.data(), sizeof(int) * B, cudaMemcpyHostToDevice);
-		cudaMemcpy(d_seq_ids_, h_seq_ids_.data(), sizeof(int) * total, cudaMemcpyHostToDevice);
-		cudaMemcpy(d_cu_seqlens_, h_cu_seqlens_.data(), sizeof(int) * (B + 1), cudaMemcpyHostToDevice);
+	void upload() {
+		size_t bytes = total_ints_ * sizeof(int);
+		cudaMemcpyAsync(d_base_, h_base_, bytes, cudaMemcpyHostToDevice);
 	}
 
-	KV_Pool		&pool_;
-	const int	NH_, NKV_, HS_;
-	int *const	d_table_;
-	int *const	d_len_;
-	int *const	d_pos_;
-	int *const	d_seq_ids_;
-	int *const	d_cu_seqlens_;
-	std::vector<int> h_table_, h_len_, h_pos_, h_seq_ids_, h_cu_seqlens_;
+	KV_Pool	&pool_;
+	const int NH_, NKV_, HS_;
+	size_t total_ints_ = 0;
+	int *d_base_, *h_base_;
+	int *d_table_, *d_len_, *d_pos_, *d_seq_ids_, *d_cu_seqlens_;
+	int *h_table_, *h_len_, *h_pos_, *h_seq_ids_, *h_cu_seqlens_;
 };

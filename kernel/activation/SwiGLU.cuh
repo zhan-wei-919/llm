@@ -6,7 +6,7 @@
 
 /*
 x [1536]  ──gate_proj→ [8960] ──silu→ ┐
-                                      ├─ ⊙ 逐元素乘 → [8960] ──down_proj→ [1536]
+                                      ├─  逐元素乘 → [8960] ──down_proj→ [1536]
 x [1536]  ──up_proj──→ [8960] ────────┘
  */
 template<typename T>

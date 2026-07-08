@@ -1,5 +1,4 @@
 #pragma once
-#include <vector>
 #include <cuda_runtime.h>
 #include "KV_pool.h"
 #include "../kernel/attention/Scatter_kv.cuh"
@@ -31,12 +30,9 @@ public:
 		d_pos_		= d_base;	d_base += S;		total_ints_ += S;
 		d_seq_ids_	= d_base;	d_base += S * L;	total_ints_ += S * L;
 		d_cu_seqlens_	= d_base;				total_ints_ += S + 1;
-		h_table_	= h_base;	h_base += S * W;
-		h_len_		= h_base;	h_base += S;
-		h_pos_		= h_base;	h_base += S;
-		h_seq_ids_	= h_base;	h_base += S * L;
-		h_cu_seqlens_	= h_base;
-
+		h_half_[0] = h_base;
+		h_half_[1] = h_base + total_ints_;
+		select_half(0);
 	}
 
 	int alloc_seq() { return pool_.alloc_seq(); }
@@ -46,6 +42,7 @@ public:
 	// q: [total, NH*HS], k/v: [total, NKV*HS] 稠密激活, out: [total, NH*HS]
 	// attention 读稠密 k/v (不查表), scatter 把同一份 k/v 写进 pool 为 decode 备货
 	void prefill(const int *slots, int B, const int *lens, const void *q, const void *k, const void *v, void *out) {
+		select_half(0);
 		int W = pool_.max_blocks_per_seq();
 		h_cu_seqlens_[0] = 0;
 		for (int b = 0; b < B; ++b) {
@@ -75,6 +72,7 @@ public:
 	// q: [B, NH*HS], k/v: [B, NKV*HS], out: [B, NH*HS] —— 第 b 行都属于 slots[b],
 	// 批内顺序是本步所有数组的共同坐标系
 	void decode(const int *slots, int B, const void *q, const void *k, const void *v, void *out) {
+		select_half(step_++ & 1);
 		int W = pool_.max_blocks_per_seq();
 		for (int b = 0; b < B; ++b)
 			h_pos_[b] = pool_.append(slots[b], 1);		// 写入起点用旧 len
@@ -103,10 +101,24 @@ private:
 		cudaMemcpyAsync(d_base_, h_base_, bytes, cudaMemcpyHostToDevice);
 	}
 
+	void select_half(int i) {
+		int S = pool_.max_seqs(), W = pool_.max_blocks_per_seq(), L = W * KV_BLOCK_SIZE;
+		int *p = h_half_[i];
+		h_base_ = p;
+		h_table_      = p;   p += S * W;
+		h_len_        = p;   p += S;
+		h_pos_        = p;   p += S;
+		h_seq_ids_    = p;   p += S * L;
+		h_cu_seqlens_ = p;
+	}
+
 	KV_Pool	&pool_;
 	const int NH_, NKV_, HS_;
 	size_t total_ints_ = 0;
 	int *d_base_, *h_base_;
 	int *d_table_, *d_len_, *d_pos_, *d_seq_ids_, *d_cu_seqlens_;
 	int *h_table_, *h_len_, *h_pos_, *h_seq_ids_, *h_cu_seqlens_;
+
+	int *h_half_[2];
+	int step_ = 0;
 };

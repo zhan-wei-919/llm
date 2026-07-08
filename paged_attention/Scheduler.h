@@ -13,6 +13,7 @@ struct Request {
 	int			max_new_tokens;
 	ReqState		state = ReqState::WAITING;
 	int			slot = -1;	// RUNNING 期间持有的 pool 行号, 其余时刻 -1
+	int			in_flight = 0;
 };
 
 struct SchedulerConfig {
@@ -54,22 +55,26 @@ public:
 		return id;
 	}
 
-	StepPlan schedule() {
+	StepPlan schedule(bool may_preempt = true) {
 		StepPlan p = try_prefill();
 		if (!p.empty()) return p;
-		return try_decode();
+		return try_decode(may_preempt);
 	}
 
 	std::vector<Request> update(const StepPlan &plan, const std::vector<int> &new_tokens) {
 		std::vector<Request> done;
 		for (size_t b = 0; b < plan.req_ids.size(); ++b) {
 			auto it = requests_.find(plan.req_ids[b]);
+			if (it == requests_.end()) continue;
 			Request &r = it->second;
+			r.in_flight--;
+			assert(r.in_flight >= 0);	// 负数说明有产 token 的步没被记账 (prefill 或 decode)
 			r.token_ids.push_back(new_tokens[b]);
-			bool stop = new_tokens[b] == cfg_.eos_token_id
-			         || (int)r.token_ids.size() - r.prompt_len >= r.max_new_tokens;
-			if (!stop) continue;
-			pool_.release(r.slot);
+			if (!(
+				new_tokens[b] == cfg_.eos_token_id ||
+				(int)r.token_ids.size() - r.prompt_len >= r.max_new_tokens
+			)){continue;}
+			pending_release_.push_back(r.slot);
 			r.slot = -1;
 			r.state = ReqState::FINISHED;
 			running_.erase(std::find(running_.begin(), running_.end(), r.id));
@@ -77,6 +82,11 @@ public:
 			requests_.erase(it);
 		}
 		return done;
+	}
+
+	void flush_release() {
+		for (int slot : pending_release_) pool_.release(slot);
+		pending_release_.clear();
 	}
 
 	size_t num_waiting() const { return waiting_.size(); }
@@ -107,6 +117,8 @@ private:
 			if ((int)pool_.num_free_blocks() - promised < need + seqs_after) break;
 			r.slot = pool_.alloc_seq();
 			r.state = ReqState::RUNNING;
+			assert(r.in_flight == 0);	// 屏障纪律: 带着在途步的请求不可能还在 waiting 里
+			r.in_flight = 1;		// prefill 本身是一个产 token 的在途步, update 会消费它
 			waiting_.pop_front();
 			running_.push_back(r.id);
 			p.req_ids.push_back(r.id);
@@ -120,13 +132,19 @@ private:
 
 	// decode 一步的块需求可以精确算出: 只有 len 恰好踩在块边界上的序列
 	// 这一步才需要新块. 不够就抢占, 直到需求被余额盖住.
-	StepPlan try_decode() {
+	StepPlan try_decode(bool may_preempt = true) {
 		StepPlan p;
-		while (!running_.empty() && decode_blocks_needed() > (int)pool_.num_free_blocks())
+		while (!running_.empty() && decode_blocks_needed() > (int)pool_.num_free_blocks()){
+			if (!may_preempt) return p;
 			preempt_last();
+		}
 		for (int id : running_) {
+			Request &r = requests_.at(id);
+			int generated = (int)r.token_ids.size() - r.prompt_len + r.in_flight;
+			if (generated >= r.max_new_tokens) continue;
+			r.in_flight++;
 			p.req_ids.push_back(id);
-			p.slots.push_back(requests_.at(id).slot);
+			p.slots.push_back(r.slot);
 		}
 		return p;
 	}
@@ -161,4 +179,5 @@ private:
 	std::unordered_map<int, Request> requests_;	// 所有权; FINISHED 的移交后即删除
 	std::deque<int>		waiting_;	// FCFS: 尾进头出; 被抢占的插回队头
 	std::vector<int>	running_;	// 本步 decode 的候选名单
+	std::vector<int>	pending_release_;	// update 时入队, flush_releases 时归还
 };

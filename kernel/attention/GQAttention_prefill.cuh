@@ -1,7 +1,7 @@
 #pragma once
 #include <cassert>
 #include "../reduce/Reduce.cuh"
-#define GQA_MAX_SEQ_LEN 4096
+#include "../../paged_attention/KV_Layout.h"
 
 //
 // 对于attention的prefill的时候, 要实现paged attention, 有两种方案
@@ -29,67 +29,73 @@
 template <typename T>
 __global__ void
 gq_attention_prefill(
-	T 		*__restrict__ out, 		// [T, NH * HS]
-	const T 	*__restrict__ q,		// [T, NH * HS]
-	const T 	*__restrict__ k, 		// [T, NKV * HS]
-	const T 	*__restrict__ v,		// [T, NKV * HS]
-	const int	*__restrict__ cu_seqlens,	// [B]
-	const int	*__restrict__ seq_ids,		// [T]
-	int B, int total_len, int NH, int NKV, int HS
+	T 		*__restrict__ out, 		// [total, NH * HS]
+	const T 	*__restrict__ q,		// [total, NH * HS]
+	const T 	*__restrict__ k_pool, 		// [num_blocks, KV_BLOCK_SIZE, NKV*HS]
+	const T 	*__restrict__ v_pool,		// [num_blocks, KV_BLOCK_SIZE, NKV*HS]
+	const int	*__restrict__ cu_seqlens,	// [B + 1]
+	const int	*__restrict__ seq_ids,		// [total]
+	const int	*__restrict__ pos_offset,	// [B]		// [64, 128, 512]每个位置表明这是prefill里的第几个chunk
+	const int 	*__restrict__ block_table,	// [B, max_blocks_per_seq]
+	int B, int NH, int NKV, int HS, int max_blocks_per_seq
 ) {
-	int t = blockIdx.x, b = seq_ids[t], len = cu_seqlens[b + 1] - cu_seqlens[b];
-	int i = t - cu_seqlens[b];
-	int h = blockIdx.y;
-	int GROUP = NH / NKV, g = h / GROUP;
+	int t = blockIdx.x, h = blockIdx.y;
+	int b = seq_ids[t], i = t - cu_seqlens[b], abs_i = pos_offset[b] + i;
+	int GROPU = NH / NKV, g = h / GROPU;
 	float scale = rsqrtf((float)HS);
-	__shared__ float scores[GQA_MAX_SEQ_LEN];
-
-	const int q_stride = NH * HS, kv_stride = NKV * HS;
+	int q_stride = NH * HS, kv_stride = NKV * HS;
+	const int *table = block_table + (size_t)b * max_blocks_per_seq;
 	const T *q_b_h = q + (size_t)t * q_stride + h * HS;
-	for (int j = threadIdx.x; j <= i; j += blockDim.x) {
+	__shared__ float scores[4096];
+
+	for (int j = threadIdx.x; j <= abs_i; j += blockDim.x) {
 		float acc = 0.0f;
-		const T *k_b_j = k + (size_t)(cu_seqlens[b] + j) * kv_stride + g * HS;
+		int phys = table[j / KV_BLOCK_SIZE], row = j % KV_BLOCK_SIZE;
+		const T *k_j = k_pool + (size_t)phys * KV_BLOCK_SIZE * kv_stride + row * kv_stride + g * HS;
 		for (int d = 0; d < HS; ++d) {
-			acc += static_cast<float>(q_b_h[d]) * static_cast<float>(k_b_j[d]);
+			acc += static_cast<float>(q_b_h[d]) * static_cast<float>(k_j[d]);
 		}
 		scores[j] = acc * scale;
 	}
 
 	float local_max = -INFINITY;
-	for (int j = threadIdx.x; j <= i; j += blockDim.x) {
+	for (int j = threadIdx.x; j <= abs_i; j += blockDim.x) {
 		local_max = device_max(local_max, scores[j]);
 	}
 	float row_max = block_max(local_max);
-	float local_sum = 0;
-	for (int j = threadIdx.x; j <= i; j += blockDim.x) {
+	float local_sum = 0.0f;
+	for (int j = threadIdx.x; j <= abs_i; j += blockDim.x) {
 		float e = expf(scores[j] - row_max);
-		local_sum += e;
 		scores[j] = e;
+		local_sum += e;
 	}
 	float Z = block_sum(local_sum), inv_z = 1.0f / Z;
 
-	T *out_b_i = out + (size_t)t * q_stride + h * HS;
+	T *out_i = out + (size_t)t * q_stride + h * HS;
 	for (int d = threadIdx.x; d < HS; d += blockDim.x) {
-		float acc = 0.0f;
-		for (int j = 0; j <= i; ++j) {
-			const T *v_b_j = v + (size_t)(cu_seqlens[b] + j) * kv_stride + g * HS;
-			acc += static_cast<float>(v_b_j[d]) * scores[j] * inv_z;
+		float acc = 0;
+		for (int j = 0; j <= abs_i; ++j) {
+			int phys = table[j / KV_BLOCK_SIZE], row = j % KV_BLOCK_SIZE;
+			const T *v_j = v_pool + (size_t)phys * KV_BLOCK_SIZE * kv_stride + row * kv_stride + g * HS;
+			acc += scores[j] * inv_z * static_cast<float>(v_j[d]);
 		}
-		out_b_i[d] = static_cast<T>(acc);
+		out_i[d] = static_cast<T>(acc);
 	}
 }
 
 template <typename T>
 void launch_gq_attention_prefill(
-	T 		*__restrict__ out, 		// [T, NH * HS]
-	const T 	*__restrict__ q,		// [T, NH * HS]
-	const T 	*__restrict__ k, 		// [T, NKV * HS]
-	const T 	*__restrict__ v,		// [T, NKV * HS]
-	const int	*__restrict__ cu_seqlens,	// [B]
-	const int	*__restrict__ seq_ids,		// [T]
-	int B, int total_len, int NH, int NKV, int HS
+	T 		*__restrict__ out, 		// [total, NH * HS]
+	const T 	*__restrict__ q,		// [total, NH * HS]
+	const T 	*__restrict__ k_pool, 		// [num_blocks, KV_BLOCK_SIZE, NKV*HS]
+	const T 	*__restrict__ v_pool,		// [num_blocks, KV_BLOCK_SIZE, NKV*HS]
+	const int	*__restrict__ cu_seqlens,	// [B + 1]
+	const int	*__restrict__ seq_ids,		// [total]
+	const int	*__restrict__ pos_offset,	// [B]		// [64, 128, 512]每个位置表明这是prefill里的第几个chunk
+	const int 	*__restrict__ block_table,	// [B, max_blocks_per_seq]
+	int B, int NH, int NKV, int HS, int max_blocks_per_seq, int total
 ) {
-	dim3 grid (total_len, NH);
+	dim3 grid (total, NH);
 	int block = 256;
-	gq_attention_prefill<T><<<grid, block>>>(out, q, k, v, cu_seqlens, seq_ids,B, total_len, NH, NKV, HS);
+	gq_attention_prefill<T><<<grid, block>>>(out, q, k_pool, v_pool, cu_seqlens, seq_ids, pos_offset, block_table, B, NH, NKV, HS, max_blocks_per_seq);
 }

@@ -62,9 +62,9 @@ public:
 				d_table_, d_cu_seqlens_, d_seq_ids_, d_pos_,
 				total, NKV_, HS_, W);
 			launch_gq_attention_prefill<T_>(
-				(T_ *)out, (const T_ *)q, (const T_ *)k, (const T_ *)v,
-				d_cu_seqlens_, d_seq_ids_,
-				B, total, NH_, NKV_, HS_);
+				(T_ *)out, (const T_ *)q, (const T_ *)pool_.k_base(), (const T_ *)pool_.v_base(),
+				d_cu_seqlens_, d_seq_ids_, d_pos_, d_table_,
+				B, NH_, NKV_, HS_, W, total);
 		});
 	}
 

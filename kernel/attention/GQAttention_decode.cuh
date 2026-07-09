@@ -22,7 +22,18 @@
 // int phys = block_table[j >> 4]	// 这里是设定的block_size = 16
 // T *k_j = k_pool + (size_t)phys * block_size * NKV * HS + NKV * HS * (j & 15)
 //
+// softmax的数学定义是 softmax(s_j) = exp(s_j) /  Σ exp(s_k)
+// 但直接算 exp(s_j) 会溢出。减去 max 不改变结果： exp(s_j - m) / Σ exp(s_k - m)
+// 也就是
+// float e = expf(scores[j] - row_max); 和 acc += static_cast<float>(v_j[d]) * scores[j] * inv_z;
+// 其中inv_z是float Z = block_sum(local_sum); float inv_z = 1.0f / Z;
+// 因为分子分母同时除以 exp(m)约掉了 所以标准做法是先扫一遍求 max 再扫一遍算 exp
+// 必须知道全局 max 才能开始算 exp——这就是为什么要把所有 scores 存下来
 //
+// 但是实际上, exp(s - m_old) * exp(m_old - m_new) = exp(s - m_new)
+// 意思是：如果之前用 m_old 当参考点算了所有 exp(s - m_old) 后来发现真正的 max 是 m_new 不用回头重算
+// 只需要整体乘以 exp(m_old - m_new) 就等价于一开始就用 m_new 算的
+
 template<typename T>
 __global__ void gq_attention_decode(
 	T		*__restrict__	out,			// [B, NH * HS]

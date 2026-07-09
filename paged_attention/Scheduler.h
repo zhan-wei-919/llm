@@ -74,6 +74,16 @@ public:
 				new_tokens[b] == cfg_.eos_token_id ||
 				(int)r.token_ids.size() - r.prompt_len >= r.max_new_tokens
 			)){continue;}
+			// 第 N-1 步的请求 EOS → update(N-1) → 进 pending_release_
+			// 第 N 步的 kernel 还在引用这些 slot 的物理块
+			// decode kernel 会往这些块里 WRITE 一条新 KV entry
+			// 第 N 步完成，event 同步确认 → flush_release() → 现在才真正归还
+			// update(N) → 可能产生新的死者 → 进 pending_release_, 留给下一轮处理
+
+			// 第 N-1 步 EOS → 直接 release → 物理块回到 free_list
+			// 下一次 schedule() 把这些块分给新请求 → 新请求 prefill 写入新 KV
+			// 但第 N 步的 kernel 还在 GPU 上跑，它也要往同一批物理块里写 KV
+			// 就会发生之前的同一片 GPU 显存上的写-写冲突的BUG
 			pending_release_.push_back(r.slot);
 			r.slot = -1;
 			r.state = ReqState::FINISHED;
@@ -117,8 +127,8 @@ private:
 			if ((int)pool_.num_free_blocks() - promised < need + seqs_after) break;
 			r.slot = pool_.alloc_seq();
 			r.state = ReqState::RUNNING;
-			assert(r.in_flight == 0);	// 屏障纪律: 带着在途步的请求不可能还在 waiting 里
-			r.in_flight = 1;		// prefill 本身是一个产 token 的在途步, update 会消费它
+			assert(r.in_flight == 0);	// 带着in_flight的请求不可能还在 waiting 里
+			r.in_flight = 1;		// prefill 本身是一个产 token 的in_flight, update 会消费它
 			waiting_.pop_front();
 			running_.push_back(r.id);
 			p.req_ids.push_back(r.id);
@@ -140,9 +150,9 @@ private:
 		}
 		for (int id : running_) {
 			Request &r = requests_.at(id);
-			int generated = (int)r.token_ids.size() - r.prompt_len + r.in_flight;
+			int generated = (int)r.token_ids.size() - r.prompt_len + r.in_flight;	// 这个请求承诺要生成的 token 总数
 			if (generated >= r.max_new_tokens) continue;
-			r.in_flight++;
+			r.in_flight++;		// 前一步的update可能还没回来
 			p.req_ids.push_back(id);
 			p.slots.push_back(r.slot);
 		}

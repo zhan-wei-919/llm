@@ -11,7 +11,7 @@
 // 主循环是深度 1 的软件流水线 (TODO 2 异步调度):
 //   发射第 N+1 步在前, 消费第 N 步的 token 在后 —— CPU 永远比 GPU 超前一步,
 //   GPU 队列不见底. 判停晚一拍生效, 物理块延迟归还 (flush_release 时机见循环内注释).
-//   prefill 和抢占走同步屏障 (先排干在途步).
+//   含追赶条目的步 (has_catchup) 和抢占走同步屏障 (先排干在途步).
 // q/k/v 常驻 device (真实系统里激活来自上一层 GEMM, 不过 PCIe);
 // token 经双份 device buffer 异步 D2H 回 pinned host 内存, event 标记完成.
 //
@@ -41,9 +41,12 @@ __global__ void fill_pattern(float *p, size_t n) {
 
 // 伪采样: 从 attention 输出算一个确定性 token.
 // 值本身无意义, 意义在于制造"下一步判停依赖本步 GPU 输出"的数据依赖.
-__global__ void fake_sample(int *tokens, const float *out, int qs) {
+// rows[b] 是第 b 条序列在打包输出里的最后一行 (它的 logits 行);
+// 纯 decode 步每序列恰 1 行, 行号即 b, 传 nullptr 走快路径.
+__global__ void fake_sample(int *tokens, const float *out, int qs, const int *rows) {
 	int b = blockIdx.x;
-	tokens[b] = 100 + (int)(fabsf(out[(size_t)b * qs]) * 997.0f) % 1000;
+	int row = rows ? rows[b] : b;
+	tokens[b] = 100 + (int)(fabsf(out[(size_t)row * qs]) * 997.0f) % 1000;
 }
 
 static double us_since(std::chrono::steady_clock::time_point t0) {
@@ -82,6 +85,8 @@ int main() {
 	int *d_tok, *h_tok;
 	cudaMalloc(&d_tok, 2 * B * sizeof(int));
 	cudaHostAlloc(&h_tok, 2 * B * sizeof(int), 0);
+	int *d_rows;					// 屏障步的采样行号 (每序列段尾), 同步路径专用
+	cudaMalloc(&d_rows, B * sizeof(int));
 	cudaEvent_t ev_tok[2];
 	cudaEventCreate(&ev_tok[0]);
 	cudaEventCreate(&ev_tok[1]);
@@ -97,7 +102,7 @@ int main() {
 	}
 	std::vector<double> t_sched, t_engine, t_wait, t_update;	// CPU 侧, 每 decode 步
 	StepPlan inflight;				// 已发射未消费的 decode 步; 空 = 流水线排空
-	int calls = 0;					// decode 发射数, 奇偶镜像 Engine 内部的 step_
+	int calls = 0;					// 流水线步发射数, 决定 token 双缓冲的奇偶
 	int step = 0, finished = 0, rows = 0;
 	// 排干: 等在途步的 token → 消费 → 全量归还 (屏障下无任何在途引用)
 	auto drain = [&]() {
@@ -117,11 +122,16 @@ int main() {
 		StepPlan plan = sched.schedule(/*may_preempt=*/inflight.empty());
 		double dt_sched = us_since(c0);
 
-		if (plan.is_prefill) {			// 屏障路径: 排干再执行, 不计时
+		// 含追赶条目的步走屏障: 追赶进度 (cached_len) 在 update 才推进,
+		// 不受 in_flight 记账保护, 投机调度会把同一个 chunk 排两遍.
+		if (plan.has_catchup) {			// 屏障路径: 排干再执行, 不计时
 			drain();
 			int nb = (int)plan.req_ids.size();
-			eng.prefill(plan.slots.data(), nb, plan.lens.data(), dq, dk, dv, dout);
-			fake_sample<<<nb, 1>>>(d_tok, dout, QS);
+			eng.forward(plan.slots.data(), nb, plan.lens.data(), dq, dk, dv, dout);
+			std::vector<int> h_rows(nb);	// 每序列采样自它那段的最后一行
+			for (int b = 0, acc = 0; b < nb; ++b) { acc += plan.lens[b]; h_rows[b] = acc - 1; }
+			cudaMemcpy(d_rows, h_rows.data(), nb * sizeof(int), cudaMemcpyHostToDevice);
+			fake_sample<<<nb, 1>>>(d_tok, dout, QS, d_rows);
 			cudaMemcpy(h_tok, d_tok, nb * sizeof(int), cudaMemcpyDeviceToHost);
 			finished += (int)sched.update(plan, std::vector<int>(h_tok, h_tok + nb)).size();
 			sched.flush_release();
@@ -138,8 +148,8 @@ int main() {
 		int p = calls++ & 1;
 		auto c1 = std::chrono::steady_clock::now();
 		cudaEventRecord(ev_start[step]);
-		eng.decode(plan.slots.data(), nb, dq, dk, dv, dout);
-		fake_sample<<<nb, 1>>>(d_tok + p * B, dout, QS);
+		eng.forward(plan.slots.data(), nb, plan.lens.data(), dq, dk, dv, dout);
+		fake_sample<<<nb, 1>>>(d_tok + p * B, dout, QS, nullptr);
 		cudaMemcpyAsync(h_tok + p * B, d_tok + p * B, nb * sizeof(int), cudaMemcpyDeviceToHost);
 		cudaEventRecord(ev_tok[p]);
 		cudaEventRecord(ev_end[step]);
@@ -224,6 +234,6 @@ int main() {
 	cudaFreeHost(h_tok);
 	cudaFree(k_base); cudaFree(v_base);
 	cudaFree(dq); cudaFree(dk); cudaFree(dv); cudaFree(dout);
-	cudaFree(d_tok);
+	cudaFree(d_tok); cudaFree(d_rows);
 	return 0;
 }

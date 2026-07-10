@@ -1,20 +1,20 @@
-// chunked prefill 的纯逻辑单测: 不碰 GPU, KV_Pool 用空指针构造 (调度路径不解引用 k/v base).
+// chunked prefill + 混合批的纯逻辑单测: 不碰 GPU, KV_Pool 用空指针构造 (调度路径不解引用 k/v base).
 // 测试扮演 Engine: 按 driver 契约, 每个 plan 返回后、下一次 schedule 前调 pool.append 落账.
 //
 // 场景 A: 单条长 prompt (80) > 预算 (32) → 切成 32/32/16 三个 chunk;
-//         中间 chunk 不产 token、slot 跨步保持; 最后一个 chunk 才进 running; decode 至完成.
+//         中间 chunk 不产 token、slot 跨步保持; 追平后进入 decode 稳态直至完成.
 // 场景 B: 两条 prompt (40/40) 共享预算 (32) → FCFS 装箱:
-//         [r0:32] → [r0:8(final), r1:24] → [r1:16(final)];
-//         验证"每步至多一个 partial 且必在队头".
+//         [r0:32] → [r0:8(final), r1:24] → 混合批 [r0:1(decode), r1:16(final)];
+//         验证"每步至多一个 partial 且必在队头", 以及 decode 不因追赶者停摆.
 //
 // 编译: g++ -std=c++17 -I/usr/local/cuda/include -o test_scheduler_chunk test_scheduler_chunk.cpp
 #include "../Scheduler.h"
 #include <cstdio>
 
-// 扮演 Engine 的 launch 时记账: prefill 按 lens append, decode 每条 1 个
+// 扮演 Engine 的 launch 时记账: 每条目 append 本步要算的 token 数
 static void engine_append(KV_Pool &pool, const StepPlan &plan) {
 	for (size_t b = 0; b < plan.req_ids.size(); ++b)
-		pool.append(plan.slots[b], plan.is_prefill ? plan.lens[b] : 1);
+		pool.append(plan.slots[b], plan.lens[b]);
 }
 
 static KV_Pool make_pool(int num_blocks, int max_seqs, int max_seq_len) {
@@ -31,7 +31,7 @@ static void test_single_long_prompt() {
 
 	// chunk 1: 预算截断出 32
 	StepPlan p1 = sched.schedule();
-	assert(p1.is_prefill && p1.req_ids.size() == 1 && p1.lens[0] == 32);
+	assert(p1.has_catchup && p1.req_ids.size() == 1 && p1.lens[0] == 32);
 	int slot = p1.slots[0];
 	engine_append(pool, p1);
 	assert((int)pool.num_free_blocks() == NB - 2);		// 32 token = 2 块
@@ -40,22 +40,23 @@ static void test_single_long_prompt() {
 
 	// chunk 2: 还是 32, slot 不变
 	StepPlan p2 = sched.schedule();
-	assert(p2.is_prefill && p2.lens[0] == 32 && p2.slots[0] == slot);
+	assert(p2.has_catchup && p2.lens[0] == 32 && p2.slots[0] == slot);
 	engine_append(pool, p2);
 	assert(sched.update(p2, {999}).empty());
 
-	// chunk 3 (final): 剩余 16, 产出第一个 token, 请求进 running
+	// chunk 3 (final): 剩余 16, 追平, 产出第一个 token, 晋升 running
 	StepPlan p3 = sched.schedule();
-	assert(p3.is_prefill && p3.lens[0] == 16 && p3.slots[0] == slot);
+	assert(p3.has_catchup && p3.lens[0] == 16 && p3.slots[0] == slot);
 	engine_append(pool, p3);
 	assert(sched.update(p3, {100}).empty());		// 产 token 但没到停止条件
 	assert(sched.num_waiting() == 0 && sched.num_running() == 1);
 
-	// decode 3 步后按 max_new_tokens=4 收尾 (prefill 产 1 + decode 产 3)
+	// decode 稳态 3 步后按 max_new_tokens=4 收尾 (追平那步产 1 + decode 产 3)
 	std::vector<Request> done;
 	for (int i = 0; i < 3; ++i) {
 		StepPlan d = sched.schedule();
-		assert(!d.is_prefill && d.req_ids.size() == 1 && d.slots[0] == slot);
+		assert(!d.has_catchup && d.req_ids.size() == 1);
+		assert(d.lens[0] == 1 && d.slots[0] == slot);	// decode 就是 len=1 的条目
 		engine_append(pool, d);
 		auto out = sched.update(d, {101 + i});
 		done.insert(done.end(), out.begin(), out.end());
@@ -92,21 +93,25 @@ static void test_two_prompts_share_budget() {
 	assert(sched.update(p2, {100, 999}).empty());		// r0 的 token 被消费, r1 的被丢弃
 	assert(sched.num_running() == 1 && sched.num_waiting() == 1);
 
-	// 步 3: prefill 独占步, r1 收尾, r0 的 decode 这一步停摆 (当前设计如此)
+	// 步 3: 混合批 —— r0 的 decode 和 r1 的 final chunk 同一步, decode 优先在前.
+	// 这正是混合批的意义: r0 不再因为 r1 在追赶而停摆.
 	StepPlan p3 = sched.schedule();
-	assert(p3.is_prefill && p3.req_ids == std::vector<int>{r1} && p3.lens[0] == 16);
+	assert(p3.has_catchup);
+	assert((p3.req_ids == std::vector<int>{r0, r1}));
+	assert((p3.lens == std::vector<int>{1, 16}));
 	engine_append(pool, p3);
-	assert(sched.update(p3, {200}).empty());
-	assert(sched.num_running() == 2 && sched.num_waiting() == 0);
+	auto done3 = sched.update(p3, {101, 200});
+	assert(done3.size() == 1 && done3[0].id == r0);		// r0 第 2 个 token 到手, 提前一步完成
+	assert(sched.num_running() == 1 && sched.num_waiting() == 0);	// r1 刚追平晋升
 
-	// 步 4: 混不进 prefill 了, decode 双请求齐跑, 各自第 2 个 token 触发 max_new_tokens
+	// 步 4: 只剩 r1 的 decode
 	StepPlan p4 = sched.schedule();
-	assert(!p4.is_prefill && p4.req_ids.size() == 2);
+	assert(!p4.has_catchup);
+	assert((p4.req_ids == std::vector<int>{r1} && p4.lens[0] == 1));
 	engine_append(pool, p4);
-	auto done = sched.update(p4, {101, 201});
-	assert(done.size() == 2);
-	for (const Request &r : done)
-		assert((int)r.token_ids.size() == 40 + 2);
+	auto done4 = sched.update(p4, {201});
+	assert(done4.size() == 1 && done4[0].id == r1);
+	assert((int)done4[0].token_ids.size() == 40 + 2);
 
 	sched.flush_release();
 	assert((int)pool.num_free_blocks() == NB);

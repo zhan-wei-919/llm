@@ -98,7 +98,7 @@ void test_type(const char *type_name) {
 		CUDA_CHECK(cudaMemset(d_out, 0, s_out));
 		float ms_vec = 0;
 		TIME_MS(ms_vec, 20, 100,
-				launch_embedding_forward(d_out, d_ids, d_tok, d_pos, B, Tlen, C));
+				launch_embedding_forward(d_out, d_ids, d_tok, d_pos, B, Tlen, C, cudaStreamPerThread));
 		CUDA_CHECK(cudaGetLastError());
 		CUDA_CHECK(cudaDeviceSynchronize());
 		CUDA_CHECK(cudaMemcpy(h_vec, d_out, s_out, cudaMemcpyDeviceToHost));

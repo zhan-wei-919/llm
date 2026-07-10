@@ -93,9 +93,9 @@ void launch_gq_attention_prefill(
 	const int	*__restrict__ seq_ids,		// [total]
 	const int	*__restrict__ pos_offset,	// [B]		// [64, 128, 512]每个位置表明这是prefill里的第几个chunk
 	const int 	*__restrict__ block_table,	// [B, max_blocks_per_seq]
-	int B, int NH, int NKV, int HS, int max_blocks_per_seq, int total
+	int B, int NH, int NKV, int HS, int max_blocks_per_seq, int total, cudaStream_t t
 ) {
 	dim3 grid (total, NH);
 	int block = 256;
-	gq_attention_prefill<T><<<grid, block>>>(out, q, k_pool, v_pool, cu_seqlens, seq_ids, pos_offset, block_table, B, NH, NKV, HS, max_blocks_per_seq);
+	gq_attention_prefill<T><<<grid, block, 0, t>>>(out, q, k_pool, v_pool, cu_seqlens, seq_ids, pos_offset, block_table, B, NH, NKV, HS, max_blocks_per_seq);
 }

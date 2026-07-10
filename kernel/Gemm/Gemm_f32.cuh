@@ -147,11 +147,11 @@ void launch_gemm_f32_forward(
 		const float	*__restrict__ bias,
 		float alpha, float beta,
 		int M, int N, int K,
-		cudaStream_t stream = nullptr
+		cudaStream_t t
 ) {
 		using Config = GemmF32Config;
 		dim3 grid((N + Config::BN - 1) / Config::BN, (M + Config::BM - 1) / Config::BM);
-		Gemm_f32<Config><<<grid, Config::T, 0, stream>>>(A, B, C, bias, alpha, beta, M, N, K);
+		Gemm_f32<Config><<<grid, Config::T, 0, t>>>(A, B, C, bias, alpha, beta, M, N, K);
 }
 
 // gemm 的 extern 分发符号统一放在 kernels.cu(见该文件尾部 gemm_forward)

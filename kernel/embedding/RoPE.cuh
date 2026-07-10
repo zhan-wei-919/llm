@@ -28,11 +28,11 @@ __global__ void rope(
 template<typename T>
 void launch_rope(
     T *x, const float *cos_table, const float *sin_table,
-    int seq_len, int n_heads, int HS, int pos0, int max_seq
+    int seq_len, int n_heads, int HS, int pos0, int max_seq, cudaStream_t t
 ) {
     assert(HS % 2 == 0);
     assert(pos0 + seq_len <= max_seq);      // cos 表行数上限
     int grid  = seq_len * n_heads;          // 一个 block = 一个 token 的一个头
     int block = HS / 2;                     // 64 线程 = 64 个小平面
-    rope<T><<<grid, block>>>(x, cos_table, sin_table, n_heads, HS, pos0);
+    rope<T><<<grid, block, 0, t>>>(x, cos_table, sin_table, n_heads, HS, pos0);
 }

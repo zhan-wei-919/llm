@@ -12,9 +12,9 @@ public:
 
 	struct StepTime {double sched_us = 0, wait_us = 0, update_us = 0;};
 
-	PipelineDriver(Scheduler &sched, const int *h_tok, int tok_stride, LaunchFn launch, FinishedFn on_finished)
+	PipelineDriver(Scheduler &sched, const int *h_tok, int tok_stride, cudaStream_t t, LaunchFn launch, FinishedFn on_finished)
 	: sched_(sched), h_tok_(h_tok), tok_stride_(tok_stride)
-	, launch_(std::move(launch)), on_finished_(std::move(on_finished)) {
+	, t_(t), launch_(std::move(launch)), on_finished_(std::move(on_finished)) {
 		cudaEventCreate(&ev_tok_[0]);
 		cudaEventCreate(&ev_tok_[1]);
 	}
@@ -35,7 +35,7 @@ public:
 		}
 		int p = calls_++ & 1;
 		launch_(plan, p);
-		cudaEventRecord(ev_tok_[p]);
+		cudaEventRecord(ev_tok_[p], t_);
 		if (!inflight_.empty()) consume(1 - p);
 		inflight_ = std::move(plan);
 		return Pump::LAUNCHED;
@@ -73,6 +73,7 @@ private:
 	Scheduler	&sched_;
 	const int	*h_tok_;
 	const int	tok_stride_;
+	cudaStream_t	t_;
 	LaunchFn	launch_;
 	FinishedFn	on_finished_;
 	cudaEvent_t	ev_tok_[2];

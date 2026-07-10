@@ -46,9 +46,9 @@ void launch_crossentropy_forward(
 		T			*__restrict__		probs,		// [B, T, V]
 		const T			*__restrict__		logits,		// [B, T, V]
 		const int		*__restrict__		targets,	// [B, T]
-		int B, int seq_len, int V
+		int B, int seq_len, int V, cudaStream_t t
 ) {
 		int grid = B * seq_len;
 		int block = 256;
-		cross_entropy<T><<<grid, block>>>(losses, probs, logits, targets, V);
+		cross_entropy<T><<<grid, block, 0, t>>>(losses, probs, logits, targets, V);
 }

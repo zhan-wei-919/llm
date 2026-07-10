@@ -96,9 +96,9 @@ void launch_gq_attention_decode(
 	const T 	*__restrict__	v_pool,			// [num_blocks, KV_BLOCK_SIZE, NKV*HS]
 	const int	*__restrict__	block_table,		// [B, max_blocks_per_seq]
 	const int 	*__restrict__	cur_len,		// [B]
-	int B, int NH, int NKV, int HS, int max_blocks_per_seq
+	int B, int NH, int NKV, int HS, int max_blocks_per_seq, cudaStream_t t
 ) {
 	dim3 grid (NH, B);
 	int block = 256;
-	gq_attention_decode<T><<<grid, block>>>(out, q, k_pool, v_pool, block_table, cur_len, B, NH, NKV, HS, max_blocks_per_seq);
+	gq_attention_decode<T><<<grid, block, 0, t>>>(out, q, k_pool, v_pool, block_table, cur_len, B, NH, NKV, HS, max_blocks_per_seq);
 }

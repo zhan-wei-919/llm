@@ -93,7 +93,7 @@ void test_type(const char *type_name) {
 		float ms = 0;
 		TIME_MS(ms, 5, 50,
 				launch_crossentropy_forward(d_losses, d_probs, d_logits, d_targets,
-						1, BT, V));
+						1, BT, V, cudaStreamPerThread));
 		CUDA_CHECK(cudaGetLastError());
 		CUDA_CHECK(cudaDeviceSynchronize());
 		CUDA_CHECK(cudaMemcpy(h_losses, d_losses, s_losses,  cudaMemcpyDeviceToHost));

@@ -42,9 +42,9 @@ __global__ void silu_mul(
 }
 
 template<typename T>
-void launch_silu_mul(T *out, const T *gate, const T *up, int N, cudaStream_t s = nullptr) {
+void launch_silu_mul(T *out, const T *gate, const T *up, int N, cudaStream_t t) {
     constexpr int VEC = sizeof(float4) / sizeof(T);
     int threads = 256;
     int blocks = (N + VEC * threads - 1) / (VEC * threads);
-    silu_mul<<<blocks, threads, 0, s>>>(out, gate, up, N);
+    silu_mul<<<blocks, threads, 0, t>>>(out, gate, up, N);
 }

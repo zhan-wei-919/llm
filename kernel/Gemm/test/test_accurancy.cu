@@ -47,7 +47,9 @@ template<typename InT, typename OutT>
 void test_type(const char *name, cublasHandle_t handle) {
 	using Cfg = GemmConfig<InT, OutT>;
 	using Traits = CublasTypeTraits<InT, OutT>;
-	cudaStream_t stream = nullptr;
+	cudaStream_t stream;
+	CUDA_CHECK(cudaStreamCreate(&stream));
+	cublasSetStream(handle, stream);
 
 	printf("\n===== %s =====\n", name);
 	printf("%-20s %8s %8s %8s  %10s %10s  %6s  %s\n",
@@ -115,6 +117,7 @@ void test_type(const char *name, cublasHandle_t handle) {
 		cudaFree(a_dev); cudaFree(b_dev); cudaFree(c_dev);
 		free(a_host); free(b_host); free(c_ours); free(c_ref);
 	}
+	CUDA_CHECK(cudaStreamDestroy(stream));
 }
 
 int main() {

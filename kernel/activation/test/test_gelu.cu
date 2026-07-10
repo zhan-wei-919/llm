@@ -73,7 +73,7 @@ void test_type(const char *type_name) {
 		CUDA_CHECK(cudaMemset(d_y, 0, bytes));
 		float ms_vec = 0;
 		TIME_MS(ms_vec, 10, 100,
-				launch_GELU_forward(d_y, d_x, N));
+				launch_GELU_forward(d_y, d_x, N, cudaStreamPerThread));
 		CUDA_CHECK(cudaGetLastError());
 		CUDA_CHECK(cudaDeviceSynchronize());
 		CUDA_CHECK(cudaMemcpy(h_vec, d_y, bytes, cudaMemcpyDeviceToHost));

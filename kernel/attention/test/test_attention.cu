@@ -105,7 +105,7 @@ void test_type(const char *type_name) {
 		CUDA_CHECK(cudaMemset(d_att, 0, s_att));
 		float ms = 0;
 		TIME_MS(ms, 5, 50,
-				launch_attention_forward(d_out, d_att, d_qkv, B, seq_len, C, NH));
+				launch_attention_forward(d_out, d_att, d_qkv, B, seq_len, C, NH, cudaStreamPerThread));
 		CUDA_CHECK(cudaGetLastError());
 		CUDA_CHECK(cudaDeviceSynchronize());
 		CUDA_CHECK(cudaMemcpy(h_out, d_out, s_out, cudaMemcpyDeviceToHost));

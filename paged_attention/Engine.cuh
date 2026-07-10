@@ -41,7 +41,7 @@ public:
 	// 要算的 token 数 —— decode 条目为 1, 追赶 chunk 为一段, 同一次发射混装.
 	// q: [total, NH*HS], k/v: [total, NKV*HS] 稠密激活, out: [total, NH*HS]
 	// scatter 先把本步 k/v 写进 pool, attention 经页表读 [0, pos+i] 的全部前缀
-	void forward(const int *slots, int B, const int *lens, const void *q, const void *k, const void *v, void *out) {
+	void forward(const int *slots, int B, const int *lens, const void *q, const void *k, const void *v, void *out, cudaStream_t t) {
 		select_half(step_++ & 1);
 		int W = pool_.max_blocks_per_seq();
 		h_cu_seqlens_[0] = 0;
@@ -53,25 +53,25 @@ public:
 		pool_.gather_tables(slots, B, h_table_, h_len_);
 		for (int b = 0, t = 0; b < B; ++b)			// 展开: 第 b 段的 lens[b] 行都属于 b
 			for (int i = 0; i < lens[b]; ++i) h_seq_ids_[t++] = b;
-		upload();
+		upload(t);
 		dtype_dispatch(pool_.dtype(), [&](auto tag) {
 			using T_ = typename decltype(tag)::type;
 			launch_scatter_kv<T_>(
 				(T_ *)pool_.k_base(), (T_ *)pool_.v_base(),
 				(const T_ *)k, (const T_ *)v,
 				d_table_, d_cu_seqlens_, d_seq_ids_, d_pos_,
-				total, NKV_, HS_, W);
+				total, NKV_, HS_, W, t);
 			launch_gq_attention_prefill<T_>(
 				(T_ *)out, (const T_ *)q, (const T_ *)pool_.k_base(), (const T_ *)pool_.v_base(),
 				d_cu_seqlens_, d_seq_ids_, d_pos_, d_table_,
-				B, NH_, NKV_, HS_, W, total);
+				B, NH_, NKV_, HS_, W, total, t);
 		});
 	}
 
 private:
-	void upload() {
+	void upload(cudaStream_t t) {
 		size_t bytes = total_ints_ * sizeof(int);
-		cudaMemcpyAsync(d_base_, h_base_, bytes, cudaMemcpyHostToDevice);
+		cudaMemcpyAsync(d_base_, h_base_, bytes, cudaMemcpyHostToDevice, t);
 	}
 
 	void select_half(int i) {

@@ -41,9 +41,9 @@ void launch_embedding_forward(
 		const int	*__restrict__		token_ids,			// [B, T]
 		const T		*__restrict__		token_table,		// [V, C]
 		const T		*__restrict__		pos_table,			// [T, C]
-		int B, int seq_len, int C
+		int B, int seq_len, int C, cudaStream_t t
 ) {
 		int grid = seq_len * B;
 		int block = 256;
-		add_token_and_pos_embedding<<<grid, block>>>(out, token_ids, token_table, pos_table, B, seq_len, C);
+		add_token_and_pos_embedding<<<grid, block, 0, t>>>(out, token_ids, token_table, pos_table, B, seq_len, C);
 }

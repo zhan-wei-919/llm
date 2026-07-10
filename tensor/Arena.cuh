@@ -2,7 +2,7 @@
 #include <cstdlib>
 #include <initializer_list>
 #include <cuda_runtime.h>
-#include "../../core/Dtype.h"
+#include "../core/Dtype.h"
 #include "Tensor.h"
 
 struct KVAlloc {

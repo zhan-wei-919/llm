@@ -99,7 +99,7 @@ void test_type(const char *type_name) {
 
 		// 正确性：从干净的 x 跑一次（kernel 原地改写）
 		CUDA_CHECK(cudaMemcpy(d_x, h_x, bytes, cudaMemcpyHostToDevice));
-		launch_rope(d_x, d_cos, d_sin, seq_len, NH, HS, pos0, MAX_SEQ);
+		launch_rope(d_x, d_cos, d_sin, seq_len, NH, HS, pos0, MAX_SEQ, cudaStreamPerThread);
 		CUDA_CHECK(cudaGetLastError());
 		CUDA_CHECK(cudaDeviceSynchronize());
 		CUDA_CHECK(cudaMemcpy(h_out, d_x, bytes, cudaMemcpyDeviceToHost));
@@ -111,7 +111,7 @@ void test_type(const char *type_name) {
 		CUDA_CHECK(cudaMemcpy(d_x, h_x, bytes, cudaMemcpyHostToDevice));
 		float ms = 0;
 		TIME_MS(ms, 10, 100,
-				launch_rope(d_x, d_cos, d_sin, seq_len, NH, HS, pos0, MAX_SEQ));
+				launch_rope(d_x, d_cos, d_sin, seq_len, NH, HS, pos0, MAX_SEQ, cudaStreamPerThread));
 		CUDA_CHECK(cudaGetLastError());
 		CUDA_CHECK(cudaDeviceSynchronize());
 

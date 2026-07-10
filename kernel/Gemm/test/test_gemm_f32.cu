@@ -62,7 +62,7 @@ void test_gemm_f32() {
 		CUDA_CHECK(cudaMemset(d_c, 0, s_c));
 		float ms_ours = 0;
 		TIME_MS(ms_ours, 5, 50,
-				launch_gemm_f32_forward(d_a, d_b, d_c, d_bias, alpha, beta, M, N, K));
+				launch_gemm_f32_forward(d_a, d_b, d_c, d_bias, alpha, beta, M, N, K, cudaStreamPerThread));
 		CUDA_CHECK(cudaGetLastError());
 		CUDA_CHECK(cudaDeviceSynchronize());
 		CUDA_CHECK(cudaMemcpy(h_ours, d_c, s_c, cudaMemcpyDeviceToHost));

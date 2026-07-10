@@ -79,9 +79,9 @@ void launch_LayerNorm_forward(T *__restrict__ out,          // [B, T, C]
                               const T *__restrict__ x,      // [B, T, C]
                               const T *__restrict__ gamma,  // [C]
                               const T *__restrict__ beta,   // [C]
-                              int B, int seq_len, int C, float eps) {
+                              int B, int seq_len, int C, float eps, cudaStream_t t) {
 	int block = 256;
 	int grid = B * seq_len;
-	layernorm<<<grid, block>>>(out, mean_out, rstd_out, x, gamma, beta, C,
+	layernorm<<<grid, block, 0, t>>>(out, mean_out, rstd_out, x, gamma, beta, C,
 	                           eps);
 }

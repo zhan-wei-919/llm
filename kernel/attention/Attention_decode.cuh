@@ -60,8 +60,8 @@ void launch_attention_decode_forward(
     const T *__restrict__ qkv,     // [1, 3C]
     const T *__restrict__ k_cache, // [t_max, C]
     const T *__restrict__ v_cache, // [t_max, C]
-    int cur_len, int C, int NH) {
+    int cur_len, int C, int NH, cudaStream_t t) {
 	int grid = NH;
 	int block = 256;
-	attention_decode<T><<<grid, block>>>(out, qkv, k_cache, v_cache, cur_len, C, NH);
+	attention_decode<T><<<grid, block, 0, t>>>(out, qkv, k_cache, v_cache, cur_len, C, NH);
 }

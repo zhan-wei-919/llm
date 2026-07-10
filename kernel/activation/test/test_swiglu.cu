@@ -75,7 +75,7 @@ void test_type(const char *type_name) {
 		CUDA_CHECK(cudaMemset(d_out, 0, bytes));
 		float ms_vec = 0;
 		TIME_MS(ms_vec, 10, 100,
-				launch_silu_mul(d_out, d_gate, d_up, N));
+				launch_silu_mul(d_out, d_gate, d_up, N, cudaStreamPerThread));
 		CUDA_CHECK(cudaGetLastError());
 		CUDA_CHECK(cudaDeviceSynchronize());
 		CUDA_CHECK(cudaMemcpy(h_vec, d_out, bytes, cudaMemcpyDeviceToHost));

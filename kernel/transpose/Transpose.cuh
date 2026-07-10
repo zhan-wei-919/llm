@@ -27,8 +27,8 @@ __global__ void transpose(T *out, const T *in, int R, int C, int out_stride) {
 
 template <typename T>
 void launch_transpose_forward(T *out, const T *in, int R, int C,
-                              int out_stride) {
+                              int out_stride, cudaStream_t t) {
   dim3 block(32, 8);
   dim3 grid((C + 31) / 32, (R + 31) / 32);
-  transpose<<<grid, block>>>(out, in, R, C, out_stride);
+  transpose<<<grid, block, 0, t>>>(out, in, R, C, out_stride);
 }

@@ -66,8 +66,8 @@ template <typename T>
 void launch_attention_forward(T *__restrict__ out,       // [B, T, C]
                               T *__restrict__ att,       // [B, NH, T, T]
                               const T *__restrict__ qkv, // [B, T, 3C]
-                              int B, int seq_len, int C, int NH) {
+                              int B, int seq_len, int C, int NH, cudaStream_t t) {
 	int grid = B * seq_len * NH;
 	int block = 256;
-	attention<T><<<grid, block>>>(out, att, qkv, B, seq_len, C, NH);
+	attention<T><<<grid, block, 0, t>>>(out, att, qkv, B, seq_len, C, NH);
 }

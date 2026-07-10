@@ -30,9 +30,9 @@ __global__ void GELU(T *y, const T *x, int N) {
 }
 
 template<typename T>
-void launch_GELU_forward(T *y, const T *x, int N, cudaStream_t s = nullptr) {
+void launch_GELU_forward(T *y, const T *x, int N, cudaStream_t t) {
 		constexpr int VEC = sizeof(float4) / sizeof(T);
 		int threads = 256;
 		int blocks = (N + VEC * threads - 1) / (VEC * threads);
-		GELU<<<blocks, threads, 0, s>>>(y, x, N);
+		GELU<<<blocks, threads, 0, t>>>(y, x, N);
 }

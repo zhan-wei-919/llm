@@ -55,6 +55,8 @@ static double us_since(std::chrono::steady_clock::time_point t0) {
 }
 
 int main() {
+	cudaStream_t t;
+	cudaStreamCreate(&t);
 	// ---------- 装配 ----------
 	int W = (MAX_SEQ_LEN + KV_BLOCK_SIZE - 1) / KV_BLOCK_SIZE;
 	int L = W * KV_BLOCK_SIZE;
@@ -79,9 +81,9 @@ int main() {
 	cudaMalloc(&dk,   rows_cap * KS * sizeof(float));
 	cudaMalloc(&dv,   rows_cap * KS * sizeof(float));
 	cudaMalloc(&dout, rows_cap * QS * sizeof(float));
-	fill_pattern<<<256, 256>>>(dq, rows_cap * QS);
-	fill_pattern<<<256, 256>>>(dk, rows_cap * KS);
-	fill_pattern<<<256, 256>>>(dv, rows_cap * KS);
+	fill_pattern<<<256, 256, 0, t>>>(dq, rows_cap * QS);
+	fill_pattern<<<256, 256, 0, t>>>(dk, rows_cap * KS);
+	fill_pattern<<<256, 256, 0, t>>>(dv, rows_cap * KS);
 	// token 通路: 双份 device buffer + pinned host, 奇偶与 Engine 的元数据半区同步轮换
 	int *d_tok, *h_tok;
 	cudaMalloc(&d_tok, 2 * B * sizeof(int));
@@ -109,17 +111,17 @@ int main() {
 		int nb = (int)plan.req_ids.size();
 		for (int b = 0, acc = 0; b < nb; ++b) { acc += plan.lens[b]; h_rows[p * B + b] = acc - 1; }
 		auto c1 = std::chrono::steady_clock::now();
-		cudaEventRecord(ev_start[step]);
-		cudaMemcpyAsync(d_rows + p * B, h_rows + p * B, nb * sizeof(int), cudaMemcpyHostToDevice);
-		eng.forward(plan.slots.data(), nb, plan.lens.data(), dq, dk, dv, dout);
-		fake_sample<<<nb, 1>>>(d_tok + p * B, dout, QS, d_rows + p * B);
-		cudaMemcpyAsync(h_tok + p * B, d_tok + p * B, nb * sizeof(int), cudaMemcpyDeviceToHost);
-		cudaEventRecord(ev_end[step]);
+		cudaEventRecord(ev_start[step], t);
+		cudaMemcpyAsync(d_rows + p * B, h_rows + p * B, nb * sizeof(int), cudaMemcpyHostToDevice, t);
+		eng.forward(plan.slots.data(), nb, plan.lens.data(), dq, dk, dv, dout, t);
+		fake_sample<<<nb, 1, 0, t>>>(d_tok + p * B, dout, QS, d_rows + p * B);
+		cudaMemcpyAsync(h_tok + p * B, d_tok + p * B, nb * sizeof(int), cudaMemcpyDeviceToHost, t);
+		cudaEventRecord(ev_end[step], t);
 		dt_engine = us_since(c1);
 		rows += nb;
 	};
 	auto on_done = [&](std::vector<Request> &&done) { finished += (int)done.size(); };
-	PipelineDriver drv(sched, h_tok, B, launch_fn, on_done);
+	PipelineDriver drv(sched, h_tok, B, t, launch_fn, on_done);
 	auto wall0 = std::chrono::steady_clock::now();
 	while (true) {
 		PipelineDriver::Pump r = drv.pump();
@@ -188,5 +190,6 @@ int main() {
 	cudaFree(k_base); cudaFree(v_base);
 	cudaFree(dq); cudaFree(dk); cudaFree(dv); cudaFree(dout);
 	cudaFree(d_tok); cudaFree(d_rows);
+	cudaStreamDestroy(t);
 	return 0;
 }

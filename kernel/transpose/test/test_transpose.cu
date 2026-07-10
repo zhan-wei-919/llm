@@ -69,7 +69,7 @@ void test_type(const char *type_name) {
 		CUDA_CHECK(cudaMemset(d_out, 0, s_data));
 		float ms_tiled = 0;
 		TIME_MS(ms_tiled, 20, 200,
-				launch_transpose_forward(d_out, d_in, R, C));
+				launch_transpose_forward(d_out, d_in, R, C, R, cudaStreamPerThread));
 		CUDA_CHECK(cudaGetLastError());
 		CUDA_CHECK(cudaDeviceSynchronize());
 		CUDA_CHECK(cudaMemcpy(h_tiled, d_out, s_data, cudaMemcpyDeviceToHost));

@@ -63,9 +63,9 @@ void launch_scatter_kv(
 	const	int	*__restrict__	cu_seqlens,	// [B + 1]
 	const	int	*__restrict__	seq_ids,	// [total]
 	const	int	*__restrict__	pos_offset,	// [B]
-	int total, int NKV, int HS, int max_blocks_per_seq
+	int total, int NKV, int HS, int max_blocks_per_seq, cudaStream_t t
 ) {
 	int grid = total;
 	int block = 256;
-	scatter_kv<T><<<grid, block>>>(k_pool, v_pool, k_src, v_src, block_table, cu_seqlens, seq_ids, pos_offset, total, NKV, HS, max_blocks_per_seq);
+	scatter_kv<T><<<grid, block, 0, t>>>(k_pool, v_pool, k_src, v_src, block_table, cu_seqlens, seq_ids, pos_offset, total, NKV, HS, max_blocks_per_seq);
 }

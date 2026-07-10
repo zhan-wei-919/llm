@@ -58,6 +58,7 @@ __global__ void fake_sample(int *tokens, const float *out, int qs, const int *ro
 }
 
 struct Ctx {		// 两次 run 共用的 device/pinned 资源, 每次 run 重建 pool/engine/scheduler
+	cudaStream_t t;
 	void *k_base, *v_base;
 	size_t kv_bytes;
 	int *d_meta, *h_meta;
@@ -89,13 +90,13 @@ static int stage_inputs(const StepPlan &plan, std::vector<int> &prog,
 static void launch_step(Ctx &c, Engine &eng, const StepPlan &plan,
                         int total, int off_rows, int off_tok) {
 	int nb = (int)plan.req_ids.size();
-	cudaMemcpyAsync(c.d_rid + off_rows, c.h_rid + off_rows, total * sizeof(int), cudaMemcpyHostToDevice);
-	cudaMemcpyAsync(c.d_pos + off_rows, c.h_pos + off_rows, total * sizeof(int), cudaMemcpyHostToDevice);
-	cudaMemcpyAsync(c.d_rows + off_tok, c.h_rows + off_tok, nb * sizeof(int), cudaMemcpyHostToDevice);
-	fill_qkv<<<total, 128>>>(c.dq, c.dk, c.dv, c.d_rid + off_rows, c.d_pos + off_rows);
-	eng.forward(plan.slots.data(), nb, plan.lens.data(), c.dq, c.dk, c.dv, c.dout);
-	fake_sample<<<nb, 1>>>(c.d_tok + off_tok, c.dout, QS, c.d_rows + off_tok);
-	cudaMemcpyAsync(c.h_tok + off_tok, c.d_tok + off_tok, nb * sizeof(int), cudaMemcpyDeviceToHost);
+	cudaMemcpyAsync(c.d_rid + off_rows, c.h_rid + off_rows, total * sizeof(int), cudaMemcpyHostToDevice, c.t);
+	cudaMemcpyAsync(c.d_pos + off_rows, c.h_pos + off_rows, total * sizeof(int), cudaMemcpyHostToDevice, c.t);
+	cudaMemcpyAsync(c.d_rows + off_tok, c.h_rows + off_tok, nb * sizeof(int), cudaMemcpyHostToDevice, c.t);
+	fill_qkv<<<total, 128, 0, c.t>>>(c.dq, c.dk, c.dv, c.d_rid + off_rows, c.d_pos + off_rows);
+	eng.forward(plan.slots.data(), nb, plan.lens.data(), c.dq, c.dk, c.dv, c.dout, c.t);
+	fake_sample<<<nb, 1, 0, c.t>>>(c.d_tok + off_tok, c.dout, QS, c.d_rows + off_tok);
+	cudaMemcpyAsync(c.h_tok + off_tok, c.d_tok + off_tok, nb * sizeof(int), cudaMemcpyDeviceToHost, c.t);
 }
 
 // 同一个 driver, 两种用法; pipelined=false 即同步 oracle
@@ -119,7 +120,7 @@ static std::vector<std::vector<int>> run(Ctx &c, bool pipelined) {
 		for (auto &r : done)
 			gen[r.id] = std::vector<int>(r.token_ids.begin() + r.prompt_len, r.token_ids.end());
 	};
-	PipelineDriver drv(sched, c.h_tok, MAX_SEQS, launch_fn, on_done);	// 声明在 sched 之后: 先析构, 先排空
+	PipelineDriver drv(sched, c.h_tok, MAX_SEQS, c.t, launch_fn, on_done);	// 声明在 sched 之后: 先析构, 先排空
 	if (pipelined) drv.run_to_idle();
 	else while (drv.pump() != PipelineDriver::Pump::IDLE) drv.drain();
 
@@ -130,6 +131,7 @@ static std::vector<std::vector<int>> run(Ctx &c, bool pipelined) {
 
 int main() {
 	Ctx c;
+	cudaStreamCreate(&c.t);
 	c.kv_bytes = (size_t)BLOCKS * KV_BLOCK_SIZE * KS * sizeof(float);
 	cudaMalloc(&c.k_base, c.kv_bytes);
 	cudaMalloc(&c.v_base, c.kv_bytes);
@@ -166,5 +168,6 @@ int main() {
 	cudaFree(c.k_base); cudaFree(c.v_base); cudaFree(c.d_meta);
 	cudaFree(c.dq); cudaFree(c.dk); cudaFree(c.dv); cudaFree(c.dout);
 	cudaFree(c.d_rid); cudaFree(c.d_pos); cudaFree(c.d_rows); cudaFree(c.d_tok);
+	cudaStreamDestroy(c.t);
 	return 0;
 }

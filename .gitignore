@@ -10,3 +10,7 @@ kernel/**/test/*
 # clangd 索引缓存
 .cache/
 compile_commands.json
+
+# gpt
+.agents
+.codex

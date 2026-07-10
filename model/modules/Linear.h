@@ -9,20 +9,20 @@
 template<typename T>
 class Linear : public Module {
 public:
-	Linear(LLM &llm, Tensor *input, int b, int t, int in_channel, int out_channel, bool has_bias, std::string prefix)
-	: input_(input), b_(b), t_(t), in_channel_(in_channel), out_channel_(out_channel), has_bias_(has_bias), prefix_(prefix){
+	Linear(LLM &llm, Tensor *input, int max_tokens, int in_channel, int out_channel, bool has_bias, std::string prefix)
+	: input_(input), in_channel_(in_channel), out_channel_(out_channel), has_bias_(has_bias), prefix_(prefix){
 		weight_ = llm.arena().alloc({in_channel_, out_channel_}, dtype_of<T>::value);
-		out_ = llm.arena().alloc({b_, t_, out_channel_}, dtype_of<T>::value);
+		out_ = llm.arena().alloc({max_tokens, out_channel_}, dtype_of<T>::value);
 		bias_ = has_bias_? llm.arena().alloc({out_channel_}, dtype_of<T>::value) : nullptr;
 		attach(llm, prefix_, *this);
 	}
 
-	void forward(cudaStream_t stream) {
+	void forward(const GraphShape &shape, cudaStream_t stream) {
 		const T *input = static_cast<const T*>(input_->ptr);
 		const T *weight = static_cast<const T*>(weight_->ptr);
 		T *out = static_cast<T*>(out_->ptr);
 		const T *bias = has_bias_? static_cast<const T*>(bias_->ptr) : nullptr;
-		int M = b_ * t_;
+		int M = shape.total_tokens;
 		int N = out_channel_;
 		int K = in_channel_;
 		if constexpr (std::is_same_v<T, float>) {
@@ -37,7 +37,7 @@ public:
 
 private:
 	Tensor *input_, *weight_, *bias_, *out_;
-	int b_, t_, in_channel_, out_channel_;
+	int in_channel_, out_channel_;
 	bool has_bias_;
 	std::string prefix_;
 };

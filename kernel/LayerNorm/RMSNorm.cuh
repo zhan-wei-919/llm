@@ -56,8 +56,8 @@ template <typename T>
 void launch_RMSNorm_forward(T *__restrict__ out,         // [B, T, C]
                             const T *__restrict__ x,     // [B, T, C]
                             const T *__restrict__ gamma, // [C]
-                            int B, int seq_len, int C, float eps, cudaStream_t t) {
+                            int rows, int C, float eps, cudaStream_t t) {
 	int block = 256;
-	int grid = B * seq_len;
+	int grid = rows;
 	rmsnorm<<<grid, block, 0, t>>>(out, x, gamma, C, eps);
 }

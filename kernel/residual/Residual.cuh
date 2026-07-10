@@ -26,8 +26,8 @@ __global__ void residual(T *out, const T *a, const T *b, int C) {		// [B, T, C]
 }
 
 template<typename T>
-void launch_residual_forward(T *out, const T *a, const T *b, int B, int seq_len, int C, cudaStream_t t) {
-		int grid = B * seq_len;
+void launch_residual_forward(T *out, const T *a, const T *b, int rows, int C, cudaStream_t t) {
+		int grid = rows;
 		int block = 256;
 		residual<<<grid, block, 0, t>>>(out, a, b, C);
 }

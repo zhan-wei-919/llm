@@ -32,6 +32,8 @@ struct StepPlan {
 	std::vector<int>	req_ids;
 	std::vector<int>	slots;
 	std::vector<int>	lens;	// 每条目本步要算的 token 数, decode 条目为 1
+	std::vector<int>	starts;	// 各条目的起始位置
+	std::vector<int>	ids;
 	bool empty() const { return req_ids.empty(); }
 };
 
@@ -82,6 +84,7 @@ public:
 			p.req_ids.push_back(id);
 			p.slots.push_back(r.slot);
 			p.lens.push_back(1);
+			p.starts.push_back(pool_.seq_len(r.slot));
 			batched_tokens += 1;
 			int len = pool_.seq_len(r.slot);
 			if (len % KV_BLOCK_SIZE == 0)       promissed_blocks++;	// 本步 append 就要新块
@@ -117,6 +120,10 @@ public:
 			if (r.slot == -1 && pool_.num_free_slots() == 0) break;
 			// —— 检查全部通过, 以下开始提交 ——
 			if (r.slot == -1) r.slot = pool_.alloc_seq();
+			p.starts.push_back(r.scheduled_len);
+			p.ids.insert(p.ids.end(),
+    				r.token_ids.begin() + r.scheduled_len,
+        			r.token_ids.begin() + r.scheduled_len + chunk_len);
 			r.scheduled_len += chunk_len;
 			p.req_ids.push_back(id);
 			p.slots.push_back(r.slot);

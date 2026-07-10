@@ -2,7 +2,7 @@
 #include <cassert>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
-#include "../../paged_attention/KV_Layout.h"
+#include "../../kv/KV_Layout.h"
 
 // scatter_kv的作用是把decode的计算结果和prefill的计算结果都写进kv pool
 // 为此, 我们需要一个pos_offset的辅助数组来表明当前的这个B下一个位置应该往哪儿写

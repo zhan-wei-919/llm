@@ -1,7 +1,7 @@
 #pragma once
 #include <cassert>
 #include "../reduce/Reduce.cuh"
-#include "../../paged_attention/KV_Layout.h"
+#include "../../kv/KV_Layout.h"
 
 //
 // 对于attention的prefill的时候, 要实现paged attention, 有两种方案

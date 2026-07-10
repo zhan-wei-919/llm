@@ -1,6 +1,6 @@
 #pragma once
 #include <cuda_runtime.h>
-#include "KV_pool.h"
+#include "../kv/KV_pool.h"
 #include "../kernel/attention/Scatter_kv.cuh"
 #include "../kernel/attention/GQAttention_prefill.cuh"
 

@@ -1,7 +1,7 @@
 #pragma once
 #include <cassert>
 #include "../reduce/Reduce.cuh"
-#include "../../paged_attention/KV_Layout.h"
+#include "../../kv/KV_Layout.h"
 #define GQA_MAX_SEQ_LEN 4096
 
 //

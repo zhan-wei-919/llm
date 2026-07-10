@@ -11,7 +11,8 @@
 // 主循环是深度 1 的软件流水线 (TODO 2 异步调度):
 //   发射第 N+1 步在前, 消费第 N 步的 token 在后 —— CPU 永远比 GPU 超前一步,
 //   GPU 队列不见底. 判停晚一拍生效, 物理块延迟归还 (flush_release 时机见循环内注释).
-//   含追赶条目的步 (has_catchup) 和抢占走同步屏障 (先排干在途步).
+//   chunk 与 decode 同走流水 (排定即落账: schedule 从 scheduled_len 接着切, 不等 update);
+//   只有抢占仍要求先排干在途步 (立即 release 会撕碎在途步引用的块).
 // q/k/v 常驻 device (真实系统里激活来自上一层 GEMM, 不过 PCIe);
 // token 经双份 device buffer 异步 D2H 回 pinned host 内存, event 标记完成.
 //
@@ -21,8 +22,9 @@
 //   CPU 各阶段计时里, "engine 调用"与 GPU 执行重叠, 不再计入气泡.
 //
 // 兼作正确性冒烟: 结尾断言块/槽位全额归还、全部请求完成、
-// decode 总行数恰为 B*(MAX_NEW-1) —— eos 关闭时 max_new 可精确预测,
-// in_flight 记账正确 ⟺ 投机浪费严格为零.
+// 批条目总数恰为 B*MAX_NEW (每请求 1 个 final chunk 条目 + MAX_NEW-1 个 decode 条目;
+// 本配置预算=B*PROMPT_LEN, 每条 prompt 一步排完, 无中间 chunk) ——
+// eos 关闭时停止全部可预测, 记账正确 ⟺ 投机浪费严格为零.
 //
 // 编译: nvcc -O2 -arch=native bench_bubble.cu -o /tmp/bench_bubble
 
@@ -41,8 +43,8 @@ __global__ void fill_pattern(float *p, size_t n) {
 
 // 伪采样: 从 attention 输出算一个确定性 token.
 // 值本身无意义, 意义在于制造"下一步判停依赖本步 GPU 输出"的数据依赖.
-// rows[b] 是第 b 条序列在打包输出里的最后一行 (它的 logits 行);
-// 纯 decode 步每序列恰 1 行, 行号即 b, 传 nullptr 走快路径.
+// rows[b] 是第 b 条序列在打包输出里的最后一行 (它的 logits 行, 即段尾);
+// chunk 与 decode 混装后行号不再恒等于 b, 统一由 host 按 lens 前缀和算好传入.
 __global__ void fake_sample(int *tokens, const float *out, int qs, const int *rows) {
 	int b = blockIdx.x;
 	int row = rows ? rows[b] : b;
@@ -85,8 +87,10 @@ int main() {
 	int *d_tok, *h_tok;
 	cudaMalloc(&d_tok, 2 * B * sizeof(int));
 	cudaHostAlloc(&h_tok, 2 * B * sizeof(int), 0);
-	int *d_rows;					// 屏障步的采样行号 (每序列段尾), 同步路径专用
-	cudaMalloc(&d_rows, B * sizeof(int));
+	// 采样行号 (每序列段尾): 与 token 同样双份轮换, host 侧 pinned 才能 async 上传
+	int *d_rows, *h_rows;
+	cudaMalloc(&d_rows, 2 * B * sizeof(int));
+	cudaHostAlloc(&h_rows, 2 * B * sizeof(int), 0);
 	cudaEvent_t ev_tok[2];
 	cudaEventCreate(&ev_tok[0]);
 	cudaEventCreate(&ev_tok[1]);
@@ -122,21 +126,6 @@ int main() {
 		StepPlan plan = sched.schedule(/*may_preempt=*/inflight.empty());
 		double dt_sched = us_since(c0);
 
-		// 含追赶条目的步走屏障: 追赶进度 (cached_len) 在 update 才推进,
-		// 不受 in_flight 记账保护, 投机调度会把同一个 chunk 排两遍.
-		if (plan.has_catchup) {			// 屏障路径: 排干再执行, 不计时
-			drain();
-			int nb = (int)plan.req_ids.size();
-			eng.forward(plan.slots.data(), nb, plan.lens.data(), dq, dk, dv, dout);
-			std::vector<int> h_rows(nb);	// 每序列采样自它那段的最后一行
-			for (int b = 0, acc = 0; b < nb; ++b) { acc += plan.lens[b]; h_rows[b] = acc - 1; }
-			cudaMemcpy(d_rows, h_rows.data(), nb * sizeof(int), cudaMemcpyHostToDevice);
-			fake_sample<<<nb, 1>>>(d_tok, dout, QS, d_rows);
-			cudaMemcpy(h_tok, d_tok, nb * sizeof(int), cudaMemcpyDeviceToHost);
-			finished += (int)sched.update(plan, std::vector<int>(h_tok, h_tok + nb)).size();
-			sched.flush_release();
-			continue;
-		}
 		if (plan.empty()) {
 			// 可能是需要抢占/全员等待在途 token: 排干后重试; 真空转说明全部完成
 			if (!inflight.empty()) { drain(); continue; }
@@ -146,10 +135,14 @@ int main() {
 		// 发射第 N+1 步 (第 N 步 = inflight 还在 GPU 上跑)
 		int nb = (int)plan.req_ids.size();
 		int p = calls++ & 1;
+		// 段尾行号: 复用与 token 相同的双缓冲纪律 —— 同奇偶的上一次使用
+		// 已在两步前被 event 确认消费, 此刻 host/device 半区都是空闲的
+		for (int b = 0, acc = 0; b < nb; ++b) { acc += plan.lens[b]; h_rows[p * B + b] = acc - 1; }
 		auto c1 = std::chrono::steady_clock::now();
 		cudaEventRecord(ev_start[step]);
+		cudaMemcpyAsync(d_rows + p * B, h_rows + p * B, nb * sizeof(int), cudaMemcpyHostToDevice);
 		eng.forward(plan.slots.data(), nb, plan.lens.data(), dq, dk, dv, dout);
-		fake_sample<<<nb, 1>>>(d_tok + p * B, dout, QS, nullptr);
+		fake_sample<<<nb, 1>>>(d_tok + p * B, dout, QS, d_rows + p * B);
 		cudaMemcpyAsync(h_tok + p * B, d_tok + p * B, nb * sizeof(int), cudaMemcpyDeviceToHost);
 		cudaEventRecord(ev_tok[p]);
 		cudaEventRecord(ev_end[step]);
@@ -190,7 +183,9 @@ int main() {
 	assert(finished == B);
 	assert((int)pool.num_free_blocks() == BLOCKS);	// 延迟释放漏一个 slot 就会在这里现形
 	assert((int)pool.num_free_slots() == B);
-	assert(rows == B * (MAX_NEW - 1));		// eos 关闭 ⇒ 停止全部可预测 ⇒ 零幽灵行
+	// 每请求恰 MAX_NEW 个产 token 条目 (1 个 final chunk + MAX_NEW-1 个 decode);
+	// eos 关闭 ⇒ 停止全部可预测 ⇒ 零幽灵行
+	assert(rows == B * MAX_NEW);
 
 	// ---------- 汇总 ----------
 	double busy = 0, gap = 0;
@@ -221,7 +216,7 @@ int main() {
 	printf("  每步 busy       %8.1f us   (上传 + scatter + attention + 采样 + D2H)\n", busy / n);
 	printf("  每步 gap        %8.1f us   (真实气泡: 流水线断流的时刻)\n", gap / (n - 1));
 	printf("  气泡占比        %8.1f %%\n\n", 100.0 * gap / (gap + busy));
-	printf("总耗时 %.1f ms, decode 吞吐 %.0f tok/s, 完成 %d 请求, decode 行数 %d (零浪费)\n",
+	printf("总耗时 %.1f ms, 生成吞吐 %.0f tok/s, 完成 %d 请求, 产 token 条目 %d (零浪费)\n",
 	       wall_ms, (double)rows / (wall_ms / 1000.0), finished, rows);
 
 	for (size_t i = 0; i < ev_start.size(); ++i) {
@@ -232,6 +227,7 @@ int main() {
 	cudaEventDestroy(ev_tok[1]);
 	cudaFreeHost(h_base);
 	cudaFreeHost(h_tok);
+	cudaFreeHost(h_rows);
 	cudaFree(k_base); cudaFree(v_base);
 	cudaFree(dq); cudaFree(dk); cudaFree(dv); cudaFree(dout);
 	cudaFree(d_tok); cudaFree(d_rows);

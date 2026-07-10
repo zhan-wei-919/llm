@@ -15,6 +15,7 @@ struct Request {
 	int			slot = -1;	// 持有 KV 期间的 pool 行号 (追赶中或 RUNNING), 其余时刻 -1
 	int			in_flight = 0;	// 已排定、update 还没消费的产 token 步数
 	int			cached_len = 0;	// 已写入 KV 的 token 数 (追赶进度)
+	int			scheduled_len = 0;	// 已经排定的KV进度
 };
 
 struct SchedulerConfig {
@@ -28,7 +29,6 @@ struct SchedulerConfig {
 // req_ids[b]		slots[b]		lens[b]
 // 请求的逻辑ID	请求在KV_pool里的行号		本步要算的token数
 struct StepPlan {
-	bool			has_catchup = false;	// 本步含追赶条目 → driver 走屏障路径
 	std::vector<int>	req_ids;
 	std::vector<int>	slots;
 	std::vector<int>	lens;	// 每条目本步要算的 token 数, decode 条目为 1
@@ -87,65 +87,68 @@ public:
 			if (len % KV_BLOCK_SIZE == 0)       promissed_blocks++;	// 本步 append 就要新块
 			if ((len + 1) % KV_BLOCK_SIZE == 0) decode_reserve++;	// 下一步 append 要新块
 		}
-		// ② 剩余预算喂给追赶中的请求. FCFS: 队头拿不满就 break, 后面的不跳队.
-		// waiting_ 里的三类居民被同一个式子覆盖:
-		// 	全新     slot == -1, cached_len == 0
-		// 	partial  slot != -1, cached_len > 0
-		// 	被抢占   slot == -1, cached_len == 0 (token_ids 含已生成部分, 全部重算)
-		int promised_decode = 0;	// 本步追平的序列里, 下一步首个 decode 就要新块的条数
-		int promised_seqs = 0;		// 本步追平、update 后会晋升进 running_ 的条数
+		// 剩余预算喂给追赶中的请求. FCFS: 队头拿不满就 break, 后面的不跳队.
 		while (!waiting_.empty()) {
 			int id = waiting_.front();
 			Request &r = requests_.at(id);
 			int target_len = (int)r.token_ids.size();
-			assert(r.cached_len < target_len);	// 追平的必须已在 running_, 不该挂在 waiting_
+			// break 必须在 assert 之前: 被预算截断的队头本次已提交过一个 chunk,
+			// 循环重访它时 scheduled_len 已领先 seq_len (plan 还没返回, 谈不上 launch),
+			// 但此时预算必然已耗尽, 先 break 才轮不到哨兵误报.
 			if (cfg_.max_num_batched_tokens - batched_tokens <= 0) break;
-			if ((int)running_.size() + promised_seqs >= cfg_.max_num_seqs) break;
+			if ((int)running_.size() + pending_seats_ >= cfg_.max_num_seqs) break;
+			assert(r.scheduled_len < target_len);	// 排完的必已出队, 不该挂在 waiting_
+			// 哨兵: schedule 入口处排定进度与 pool 落账一致, 抓 driver 漏 launch
+			assert(r.slot == -1 || r.scheduled_len == pool_.seq_len(r.slot));
 			int chunk_len = std::min(
-				target_len - r.cached_len,
+				target_len - r.scheduled_len,
 				cfg_.max_num_batched_tokens - batched_tokens);
 			assert(chunk_len > 0);	// 零进度 chunk 一旦被准入, 系统会无声空转
-			int old_blocks = blocks_needed(r.cached_len);
-			int new_blocks = blocks_needed(r.cached_len + chunk_len);
+			int old_blocks = blocks_needed(r.scheduled_len);
+			int new_blocks = blocks_needed(r.scheduled_len + chunk_len);
 			int need_blocks = new_blocks - old_blocks;
-			bool is_final = (r.cached_len + chunk_len == target_len);
+			bool is_final = (r.scheduled_len + chunk_len == target_len);
 			// 追平后的 len 恰好踩块边界时, 它下一步的首个 decode token 就要新块
 			bool ends_on_boundary = (target_len % KV_BLOCK_SIZE == 0);
 			// 预留"明天的账": 保证本次准入不会成为下一步 decode 抢占的直接原因.
 			// 预留量只由需求侧决定, 不引用空闲量 —— 否则块紧张时保护恰好失效.
-			int reserve = decode_reserve + promised_decode + ((is_final && ends_on_boundary) ? 1 : 0);
+			int reserve = decode_reserve + pending_boundary_ + ((is_final && ends_on_boundary) ? 1 : 0);
 			if ((int)pool_.num_free_blocks() - promissed_blocks < need_blocks + reserve) break;
 			if (r.slot == -1 && pool_.num_free_slots() == 0) break;
 			// —— 检查全部通过, 以下开始提交 ——
 			if (r.slot == -1) r.slot = pool_.alloc_seq();
-			waiting_.pop_front();
-			p.has_catchup = true;	// 追赶条目不受 in_flight 记账保护, driver 须走屏障
+			r.scheduled_len += chunk_len;
 			p.req_ids.push_back(id);
 			p.slots.push_back(r.slot);
 			p.lens.push_back(chunk_len);
 			batched_tokens += chunk_len;
 			promissed_blocks += need_blocks;
-			if (is_final && ends_on_boundary) promised_decode += 1;
-			if (is_final) { r.in_flight += 1; promised_seqs += 1; }
+			if (is_final) {
+				waiting_.pop_front();
+				r.in_flight += 1;
+				pending_seats_ += 1;
+				if (ends_on_boundary) pending_boundary_ += 1;
+			}
 		}
 		return p;
 	}
 
 	std::vector<Request> update(const StepPlan &plan, const std::vector<int> &new_tokens) {
 		std::vector<Request> done;
-		std::vector<int> partial;
 		for (size_t b = 0; b < plan.req_ids.size(); ++b) {
 			auto it = requests_.find(plan.req_ids[b]);
 			if (it == requests_.end()) continue;
 			Request &r = it->second;
 
 			r.cached_len += plan.lens[b];
-			if (r.cached_len < (int)r.token_ids.size()) {	// 中间chunk无token
-				partial.push_back(r.id);
-				continue;
-			}
+			if (r.cached_len < (int)r.token_ids.size()) continue;
 			r.in_flight--;
 			assert(r.in_flight >= 0);	// 负数说明有产 token 的步没被记账
+			if (r.state != ReqState::RUNNING) {
+				pending_seats_--;
+				if (r.cached_len % KV_BLOCK_SIZE == 0) pending_boundary_--;
+				assert(pending_seats_ >= 0 && pending_boundary_ >= 0);
+			}
 			r.token_ids.push_back(new_tokens[b]);
 			if (!(
 				new_tokens[b] == cfg_.eos_token_id ||
@@ -185,7 +188,6 @@ public:
 			done.push_back(std::move(r));
 			requests_.erase(it);
 		}
-		waiting_.insert(waiting_.begin(), partial.begin(), partial.end());
 		return done;
 	}
 
@@ -223,6 +225,7 @@ private:
 		pool_.release(r.slot);
 		r.slot = -1;
 		r.cached_len = 0;
+		r.scheduled_len = 0;
 		r.state = ReqState::WAITING;
 		waiting_.push_front(id);
 		++preempt_count_;
@@ -233,6 +236,8 @@ private:
 	const int		total_blocks_;	// 装配时的块总量, add_request 边界验证用
 	int			next_id_ = 0;
 	int			preempt_count_ = 0;	// 记录总共发生了多少次抢占
+	int			pending_seats_ = 0;	// final chunk已经确定了, 但是当前还在waiting
+	int			pending_boundary_ = 0;	// 其中追平后恰好踩在边界的条数
 	std::unordered_map<int, Request> requests_;	// 所有权; FINISHED 的移交后即删除
 	std::deque<int>		waiting_;	// FCFS: 尾进头出; 被抢占的插回队头
 	std::vector<int>	running_;	// 已追平的序列: 每步作为 decode 条目优先上车

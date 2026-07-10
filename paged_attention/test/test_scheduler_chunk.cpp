@@ -2,10 +2,14 @@
 // 测试扮演 Engine: 按 driver 契约, 每个 plan 返回后、下一次 schedule 前调 pool.append 落账.
 //
 // 场景 A: 单条长 prompt (80) > 预算 (32) → 切成 32/32/16 三个 chunk;
-//         中间 chunk 不产 token、slot 跨步保持; 追平后进入 decode 稳态直至完成.
+//         中间 chunk 不产 token、slot 跨步保持、partial 全程不离开 waiting 队头;
+//         追平后进入 decode 稳态直至完成.
 // 场景 B: 两条 prompt (40/40) 共享预算 (32) → FCFS 装箱:
 //         [r0:32] → [r0:8(final), r1:24] → 混合批 [r0:1(decode), r1:16(final)];
 //         验证"每步至多一个 partial 且必在队头", 以及 decode 不因追赶者停摆.
+// 场景 C: 投机连排 —— 三个 chunk 连续排定, 中间不夹任何 update (流水线的调度侧本质).
+//         排定即落账 (scheduled_len): 每次 schedule 都从排定进度接着切, 不重复、不隐身;
+//         final 排定即出队, 晋升等 update, 中间有一拍可接受的空 plan.
 //
 // 编译: g++ -std=c++17 -I/usr/local/cuda/include -o test_scheduler_chunk test_scheduler_chunk.cpp
 #include "../Scheduler.h"
@@ -31,22 +35,24 @@ static void test_single_long_prompt() {
 
 	// chunk 1: 预算截断出 32
 	StepPlan p1 = sched.schedule();
-	assert(p1.has_catchup && p1.req_ids.size() == 1 && p1.lens[0] == 32);
+	assert(p1.req_ids.size() == 1 && p1.lens[0] == 32);
 	int slot = p1.slots[0];
 	engine_append(pool, p1);
 	assert((int)pool.num_free_blocks() == NB - 2);		// 32 token = 2 块
+	assert(sched.num_waiting() == 1);			// partial 不出队, 一直占着队头
 	assert(sched.update(p1, {999}).empty());		// 中间 chunk: 假 token 必须被丢弃
-	assert(sched.num_waiting() == 1 && sched.num_running() == 0);	// partial 回 waiting
+	assert(sched.num_waiting() == 1 && sched.num_running() == 0);
 
 	// chunk 2: 还是 32, slot 不变
 	StepPlan p2 = sched.schedule();
-	assert(p2.has_catchup && p2.lens[0] == 32 && p2.slots[0] == slot);
+	assert(p2.lens[0] == 32 && p2.slots[0] == slot);
 	engine_append(pool, p2);
 	assert(sched.update(p2, {999}).empty());
 
-	// chunk 3 (final): 剩余 16, 追平, 产出第一个 token, 晋升 running
+	// chunk 3 (final): 剩余 16, 排定即出队; 追平产出第一个 token, 晋升 running
 	StepPlan p3 = sched.schedule();
-	assert(p3.has_catchup && p3.lens[0] == 16 && p3.slots[0] == slot);
+	assert(p3.lens[0] == 16 && p3.slots[0] == slot);
+	assert(sched.num_waiting() == 0);			// final 排定即出队, 晋升等 update
 	engine_append(pool, p3);
 	assert(sched.update(p3, {100}).empty());		// 产 token 但没到停止条件
 	assert(sched.num_waiting() == 0 && sched.num_running() == 1);
@@ -55,7 +61,7 @@ static void test_single_long_prompt() {
 	std::vector<Request> done;
 	for (int i = 0; i < 3; ++i) {
 		StepPlan d = sched.schedule();
-		assert(!d.has_catchup && d.req_ids.size() == 1);
+		assert(d.req_ids.size() == 1);
 		assert(d.lens[0] == 1 && d.slots[0] == slot);	// decode 就是 len=1 的条目
 		engine_append(pool, d);
 		auto out = sched.update(d, {101 + i});
@@ -96,7 +102,6 @@ static void test_two_prompts_share_budget() {
 	// 步 3: 混合批 —— r0 的 decode 和 r1 的 final chunk 同一步, decode 优先在前.
 	// 这正是混合批的意义: r0 不再因为 r1 在追赶而停摆.
 	StepPlan p3 = sched.schedule();
-	assert(p3.has_catchup);
 	assert((p3.req_ids == std::vector<int>{r0, r1}));
 	assert((p3.lens == std::vector<int>{1, 16}));
 	engine_append(pool, p3);
@@ -106,7 +111,6 @@ static void test_two_prompts_share_budget() {
 
 	// 步 4: 只剩 r1 的 decode
 	StepPlan p4 = sched.schedule();
-	assert(!p4.has_catchup);
 	assert((p4.req_ids == std::vector<int>{r1} && p4.lens[0] == 1));
 	engine_append(pool, p4);
 	auto done4 = sched.update(p4, {201});
@@ -120,9 +124,58 @@ static void test_two_prompts_share_budget() {
 	printf("test_two_prompts_share_budget PASS\n");
 }
 
+// 投机流水的调度侧本质: 连排三个 chunk, 中间不夹 update.
+// 旧屏障语义下 p2 会是空 plan (请求排定后出队隐身, 进度只在 update 推进);
+// 排定即落账后, 每次 schedule 都从 scheduled_len 接着切下一段.
+static void test_chunks_schedule_ahead() {
+	const int NB = 100;
+	KV_Pool pool = make_pool(NB, /*max_seqs=*/4, /*max_seq_len=*/256);
+	Scheduler sched(pool, {/*max_num_seqs=*/4, /*max_num_batched_tokens=*/32, /*eos=*/-1});
+	sched.add_request(std::vector<int>(80, 7), /*max_new_tokens=*/4);
+
+	StepPlan p1 = sched.schedule();
+	assert(p1.req_ids.size() == 1 && p1.lens[0] == 32);	// [0,32)
+	int slot = p1.slots[0];
+	engine_append(pool, p1);		// 契约: 已返回的 plan 先 launch, 再调下一次 schedule
+	StepPlan p2 = sched.schedule();		// ← update(p1) 还没发生
+	assert(p2.req_ids.size() == 1 && p2.lens[0] == 32 && p2.slots[0] == slot);	// [32,64)
+	engine_append(pool, p2);
+	StepPlan p3 = sched.schedule();
+	assert(p3.req_ids.size() == 1 && p3.lens[0] == 16 && p3.slots[0] == slot);	// [64,80) final
+	engine_append(pool, p3);
+	assert(sched.num_waiting() == 0 && sched.num_running() == 0);	// 排完出队, 晋升等 update
+	assert(sched.schedule().empty());	// 全部在途: 接受的一拍空隙
+
+	// 结算按发射顺序补齐, 三本在途账 (scheduled-cached, in_flight, pending_*) 收敛归零
+	assert(sched.update(p1, {999}).empty());	// 中间 chunk: 假 token 丢弃
+	assert(sched.update(p2, {999}).empty());
+	assert(sched.update(p3, {100}).empty());	// 追平: 首 token 入账, 晋升
+	assert(sched.num_running() == 1);
+
+	// decode 收尾 (max_new=4: 追平产 1 + decode 产 3), 资源守恒
+	std::vector<Request> done;
+	for (int i = 0; i < 3; ++i) {
+		StepPlan d = sched.schedule();
+		assert(d.lens[0] == 1 && d.slots[0] == slot);
+		engine_append(pool, d);
+		auto out = sched.update(d, {101 + i});
+		done.insert(done.end(), out.begin(), out.end());
+	}
+	assert(done.size() == 1);
+	assert((int)done[0].token_ids.size() == 80 + 4);
+	assert(done[0].token_ids[80] == 100 && done[0].token_ids[83] == 103);
+
+	sched.flush_release();
+	assert((int)pool.num_free_blocks() == NB);
+	assert((int)pool.num_free_slots() == 4);
+	assert(sched.num_preemptions() == 0);
+	printf("test_chunks_schedule_ahead PASS\n");
+}
+
 int main() {
 	test_single_long_prompt();
 	test_two_prompts_share_budget();
+	test_chunks_schedule_ahead();
 	printf("all tests PASS\n");
 	return 0;
 }

@@ -21,25 +21,25 @@ __global__ void Gemm (
 		int block_row = blockIdx.y * Config::BM, block_col = blockIdx.x * Config::BN;
 		int warp_id = threadIdx.x / 32, warp_row = warp_id / Config::WARPS_N, warp_col = warp_id % Config::WARPS_N;
 		int wm0 = warp_row * Config::WM, wn0 = warp_col * Config::WN;
-		
+
 		extern __shared__ char smem_buf[];
 		auto &shared_a = *reinterpret_cast<typename Config::In(*)[2][Config::BM][Config::BK + Config::PAD]>(smem_buf);
 		auto &shared_b = *reinterpret_cast<typename Config::In(*)[2][Config::BK][Config::BN + Config::PAD]>(
 				smem_buf + sizeof(typename Config::In) * 2 * Config::BM * (Config::BK + Config::PAD));
-		
+
 		wmma::fragment<wmma::accumulator, Config::WMMA_M, Config::WMMA_N, Config::WMMA_K, typename Config::Acc> c_frag[Config::FM][Config::FN];
 		for (int m = 0; m < Config::FM; ++m) {
 				for (int n = 0; n < Config::FN; ++n) {
 						wmma::fill_fragment(c_frag[m][n], 0);
 				}
 		}
-		
+
 		TileLoader<Config> loader {
 				A, B, tid,
 				block_row, block_col,
 				M, N, K
 		};
-		
+
 		int cur = 0;
 
 #if __CUDA_ARCH__ >= 800
@@ -111,19 +111,19 @@ __global__ void Gemm (
 		}
 #endif
 		__syncthreads();
-		
+
 		auto *smem_base = reinterpret_cast<typename Config::Acc*>(&shared_a[0][0][0]);
 		typename Config::Acc *warp_c = smem_base + warp_id * (Config::WMMA_M * Config::WMMA_N);
-		
+
 		int lane = tid &31;
-		
+
 		for (int m = 0; m < Config::FM; ++m) {
 				for (int n = 0; n < Config::FN; ++n) {
 						wmma::store_matrix_sync(warp_c, c_frag[m][n], Config::WMMA_N, wmma::mem_row_major);
 						__syncwarp();
 						int tile_row = block_row + wm0 + m * Config::WMMA_M;
 						int tile_col = block_col + wn0 + n * Config::WMMA_N;
-						
+
 						for (int e = lane; e < Config::WMMA_M * Config::WMMA_N; e += 32) {
 								int r = e / Config::WMMA_N, c = e % Config::WMMA_N;
 								int gr = tile_row + r, gc = tile_col + c;
@@ -132,12 +132,12 @@ __global__ void Gemm (
 										typename  Config::Acc v = alpha * warp_c[r * Config::WMMA_N + c];
 										if (beta != 0) v += beta * static_cast<typename Config::Acc>(C[idx]);
 										if (bias)	   v += static_cast<typename Config::Acc>(bias[gc]);
-										C[idx] = static_cast<typename Config::Out>(v); 
+										C[idx] = static_cast<typename Config::Out>(v);
 								}
 						}
 						__syncwarp();
 				}
-		}	
+		}
 }
 
 template<typename Config>
@@ -248,7 +248,7 @@ __global__ void GemmMma (
 
 template<typename Config>
 void launch_Gemm_forward(
-		const typename Config::In *A, 
+		const typename Config::In *A,
 		const typename Config::In *B,
 		typename Config::Out *C,
 		const typename Config::Out *bias,

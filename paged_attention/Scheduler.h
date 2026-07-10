@@ -4,21 +4,23 @@
 #include <unordered_map>
 #include <algorithm>
 
-enum class ReqState { WAITING, RUNNING, FINISHED };
+enum class ReqState { WAITING, PREFILLING, RUNNING, FINISHED };
 
 struct Request {
 	int			id;
-	std::vector<int>	token_ids;	// prompt + 已生成; 唯一真相源, 抢占后重算全靠它
+	std::vector<int>	token_ids;	// prompt + 已生成的token
 	int			prompt_len;	// token_ids 前多少个是 prompt
 	int			max_new_tokens;
 	ReqState		state = ReqState::WAITING;
 	int			slot = -1;	// RUNNING 期间持有的 pool 行号, 其余时刻 -1
 	int			in_flight = 0;
+	int			cached_len = 0;	// prefill chunk进的行数
 };
 
 struct SchedulerConfig {
 	int	max_num_seqs;		// running 数上限, 即每步 B 的上限
-	int	max_num_batched_tokens;	// 单步 prefill 的 token 总预算
+	int	max_num_batched_tokens;	// 单步 prefill 的 token 总预算; 同时也是 chunk 粒度:
+					// 长 prompt 被预算截断成块, 每步至多产生一个 partial 且必在队头
 	int	eos_token_id;
 };
 
@@ -63,17 +65,33 @@ public:
 
 	std::vector<Request> update(const StepPlan &plan, const std::vector<int> &new_tokens) {
 		std::vector<Request> done;
+		std::vector<int> partial;
 		for (size_t b = 0; b < plan.req_ids.size(); ++b) {
 			auto it = requests_.find(plan.req_ids[b]);
 			if (it == requests_.end()) continue;
 			Request &r = it->second;
+
+			if (plan.is_prefill) {
+				r.cached_len += plan.lens[b];
+				if (r.cached_len < r.token_ids.size()) {
+					r.state = ReqState::WAITING;
+					partial.push_back(r.id);
+					continue;
+				}
+			}
 			r.in_flight--;
 			assert(r.in_flight >= 0);	// 负数说明有产 token 的步没被记账 (prefill 或 decode)
 			r.token_ids.push_back(new_tokens[b]);
 			if (!(
 				new_tokens[b] == cfg_.eos_token_id ||
-				(int)r.token_ids.size() - r.prompt_len >= r.max_new_tokens
-			)){continue;}
+				r.token_ids.size() - r.prompt_len >= r.max_new_tokens
+			)){
+				if (plan.is_prefill) {
+					r.state = ReqState::RUNNING;
+					running_.push_back(r.id);
+				}
+				continue;
+			}
 			// 第 N-1 步的请求 EOS → update(N-1) → 进 pending_release_
 			// 第 N 步的 kernel 还在引用这些 slot 的物理块
 			// decode kernel 会往这些块里 WRITE 一条新 KV entry
@@ -84,13 +102,22 @@ public:
 			// 下一次 schedule() 把这些块分给新请求 → 新请求 prefill 写入新 KV
 			// 但第 N 步的 kernel 还在 GPU 上跑，它也要往同一批物理块里写 KV
 			// 就会发生之前的同一片 GPU 显存上的写-写冲突的BUG
-			pending_release_.push_back(r.slot);
-			r.slot = -1;
+			if (r.slot != -1) {
+				pending_release_.push_back(r.slot);
+				r.slot = -1;
+			}
 			r.state = ReqState::FINISHED;
-			running_.erase(std::find(running_.begin(), running_.end(), r.id));
+			auto rpos = std::find(running_.begin(), running_.end(), r.id);
+			if (rpos != running_.end()) {
+				running_.erase(rpos);
+			} else {
+				auto wpos = std::find(waiting_.begin(), waiting_.end(), r.id);
+				if (wpos != waiting_.end()) waiting_.erase(wpos);
+			}
 			done.push_back(std::move(r));
 			requests_.erase(it);
 		}
+		waiting_.insert(waiting_.begin(), partial.begin(), partial.end());
 		return done;
 	}
 
@@ -108,34 +135,56 @@ private:
 		return (len + KV_BLOCK_SIZE - 1) / KV_BLOCK_SIZE;
 	}
 
+	// 在chunked prefill里面, 要注意的是, 现在一个request有两种语意
+	// 可能是已经在run的, 并且最后一个chunk, 会产出token
+	// 另一种是不是最后一个chunk, 这种不会产出新的token, 并且这种情况下需要一直抢占slot
+	// 伴随而来的, 在waiting_队列里的, 也有两种request
+	// 	1.完全还没进KV Pool	slot == -1, cached_len == 0
+	// 	2.已经写了一部分cache了	slot != -1, cached_len > 0
+	// 因为进入waitting的一定至少跑了一个chunk或者一个chunk都没跑, 所以不可能出现slot != -1 && cached_len == 0的情况
 	StepPlan try_prefill() {
 		StepPlan p;
-		p.is_prefill = true;
-		int promised = 0, batched_tokens = 0;
+		p.is_prefill = 1;
+		int batched_tokens = 0;
+		int promissed_blocks = 0;
+		int promised_decode = 0;	// 本轮准入的 final chunk 里, 完成后首步 decode 就要新块的条数
+		int decode_reserve = decode_blocks_needed();	// running_ 在本轮内不变, 是循环不变量
 		while (!waiting_.empty()) {
-			Request &r = requests_.at(waiting_.front());
-			int len = (int)r.token_ids.size();
+			int id = waiting_.front();
+			Request &r = requests_.at(id);
+			int target_len = r.token_ids.size();
+			assert(r.cached_len < target_len);	// 如果这儿出现了已经完成了最后一个chunk但是还是进入了try_prefill的情况一定是bug
+			if (cfg_.max_num_batched_tokens - batched_tokens <= 0) break;
 			if ((int)running_.size() >= cfg_.max_num_seqs) break;
-			// 如果已经有请求了, 且这条请求的长度会超预算, 就break, 或者目前没有请求, 直接放行
-			if (!p.req_ids.empty() && batched_tokens + len > cfg_.max_num_batched_tokens) break;
-			if (pool_.num_free_slots() == 0) break;
-			int need = blocks_needed(len);
-			int seqs_after = (int)running_.size() + 1;
-			// 换句话说, 这行的意思是, 当前所有真正的空闲的物理块, 减去我承诺要分配的, 够不够分配
-			// need是加入这块后, 需要分配的块数, seqs_after是我下一步正在的decode的, 他们最坏情况下会要一个新的block
-			// 也就是我当前的情况, 够不够我的下一轮分配
-			if ((int)pool_.num_free_blocks() - promised < need + seqs_after) break;
-			r.slot = pool_.alloc_seq();
-			r.state = ReqState::RUNNING;
-			assert(r.in_flight == 0);	// 带着in_flight的请求不可能还在 waiting 里
-			r.in_flight = 1;		// prefill 本身是一个产 token 的in_flight, update 会消费它
+			int chunk_len = std::min(
+				target_len - r.cached_len,
+				cfg_.max_num_batched_tokens - batched_tokens);
+			assert(chunk_len > 0);	// 零进度 chunk 一旦被准入, 系统会无声空转
+			int old_blocks = blocks_needed(r.cached_len);
+			int new_blocks = blocks_needed(r.cached_len + chunk_len);
+			int need_blocks = new_blocks - old_blocks;
+			bool is_final = (r.cached_len + chunk_len == target_len);
+			// prefill 完的 len 恰好踩块边界时, 首个 decode token 就要新块
+			bool ends_on_boundary = (target_len % KV_BLOCK_SIZE == 0);
+			// 保证本次准入不会成为下一个 decode 步抢占的直接原因.
+			// 预留量只由需求侧决定, 不引用空闲量 —— 否则块紧张时保护恰好失效.
+			int reserve = decode_reserve + promised_decode
+				+ ((is_final && ends_on_boundary) ? 1 : 0);
+			if ((int)pool_.num_free_blocks() - promissed_blocks < need_blocks + reserve) break;
+			if (r.slot == -1 && pool_.num_free_slots() == 0) break;
+			// —— 检查全部通过, 以下开始提交 ——
+			if (r.slot == -1) {
+				r.slot = pool_.alloc_seq();
+				r.state = ReqState::PREFILLING;
+			}
 			waiting_.pop_front();
-			running_.push_back(r.id);
-			p.req_ids.push_back(r.id);
+			p.req_ids.push_back(id);
 			p.slots.push_back(r.slot);
-			p.lens.push_back(len);
-			promised += need;
-			batched_tokens += len;
+			p.lens.push_back(chunk_len);
+			batched_tokens += chunk_len;
+			promissed_blocks += need_blocks;
+			if (is_final && ends_on_boundary) promised_decode += 1;
+			if (is_final) r.in_flight += 1;
 		}
 		return p;
 	}
@@ -176,6 +225,7 @@ private:
 		Request &r = requests_.at(id);
 		pool_.release(r.slot);
 		r.slot = -1;
+		r.cached_len = 0;
 		r.state = ReqState::WAITING;
 		waiting_.push_front(id);
 		++preempt_count_;

@@ -1,5 +1,5 @@
 #pragma once
-#include "../../core/Dtype.h"
+#include "../core/Dtype.h"
 
 constexpr int MAX_DIMS = 4;
 

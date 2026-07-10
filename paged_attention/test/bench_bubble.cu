@@ -1,6 +1,7 @@
 #include "../Engine.cuh"
 #include "../Scheduler.h"
-#include "../tensor/Arena.cuh"
+#include "../Driver.h"
+#include "../../tensor/Arena.cuh"
 #include <cstdio>
 #include <vector>
 #include <chrono>
@@ -8,11 +9,9 @@
 
 // 手工性能基准: 测量 decode 闭环的"步间气泡". 不进默认测试.
 //
-// 主循环是深度 1 的软件流水线 (TODO 2 异步调度):
-//   发射第 N+1 步在前, 消费第 N 步的 token 在后 —— CPU 永远比 GPU 超前一步,
-//   GPU 队列不见底. 判停晚一拍生效, 物理块延迟归还 (flush_release 时机见循环内注释).
-//   chunk 与 decode 同走流水 (排定即落账: schedule 从 scheduled_len 接着切, 不等 update);
-//   只有抢占仍要求先排干在途步 (立即 release 会撕碎在途步引用的块).
+// 时序骨架由 PipelineDriver 提供 (深度 1 投机流水: 发射 N+1 在前, 消费 N 在后,
+// chunk 与 decode 同走流水, 抢占只在排空态放行, 先 flush 后 update).
+// 本文件只提供"怎么算一步"(launch 闭包) 与观测 (计时/气泡/守恒断言).
 // q/k/v 常驻 device (真实系统里激活来自上一层 GEMM, 不过 PCIe);
 // token 经双份 device buffer 异步 D2H 回 pinned host 内存, event 标记完成.
 //
@@ -91,10 +90,6 @@ int main() {
 	int *d_rows, *h_rows;
 	cudaMalloc(&d_rows, 2 * B * sizeof(int));
 	cudaHostAlloc(&h_rows, 2 * B * sizeof(int), 0);
-	cudaEvent_t ev_tok[2];
-	cudaEventCreate(&ev_tok[0]);
-	cudaEventCreate(&ev_tok[1]);
-
 	for (int i = 0; i < B; ++i)
 		sched.add_request(std::vector<int>(PROMPT_LEN, i), MAX_NEW);
 
@@ -104,39 +99,14 @@ int main() {
 		cudaEventCreate(&ev_start[i]);
 		cudaEventCreate(&ev_end[i]);
 	}
-	std::vector<double> t_sched, t_engine, t_wait, t_update;	// CPU 侧, 每 decode 步
-	StepPlan inflight;				// 已发射未消费的 decode 步; 空 = 流水线排空
-	int calls = 0;					// 流水线步发射数, 决定 token 双缓冲的奇偶
+	std::vector<double> t_sched, t_engine, t_wait, t_update;	// CPU 侧, 每 launched 步
 	int step = 0, finished = 0, rows = 0;
-	// 排干: 等在途步的 token → 消费 → 全量归还 (屏障下无任何在途引用)
-	auto drain = [&]() {
-		if (inflight.empty()) return;
-		int q = (calls - 1) & 1;		// 在途步的奇偶
-		cudaEventSynchronize(ev_tok[q]);
-		finished += (int)sched.update(inflight,
-			std::vector<int>(h_tok + q * B, h_tok + q * B + inflight.req_ids.size())).size();
-		sched.flush_release();
-		inflight = StepPlan{};
-	};
-	auto wall0 = std::chrono::steady_clock::now();
-	while (true) {
-		auto c0 = std::chrono::steady_clock::now();
-		// 投机调度: 在上一步 token 未回来时组下一步计划 (赌无人 EOS).
-		// 有在途步时禁止抢占 —— 立即 release 会撕碎在途步引用的块.
-		StepPlan plan = sched.schedule(/*may_preempt=*/inflight.empty());
-		double dt_sched = us_since(c0);
-
-		if (plan.empty()) {
-			// 可能是需要抢占/全员等待在途 token: 排干后重试; 真空转说明全部完成
-			if (!inflight.empty()) { drain(); continue; }
-			break;
-		}
-
-		// 发射第 N+1 步 (第 N 步 = inflight 还在 GPU 上跑)
+	double dt_engine = 0;				// launch 闭包量的本步入队耗时
+	// "怎么算一步": 段尾行号 staging + 全部 GPU 命令异步入队 (契约: 不做任何同步).
+	// 段尾行号复用与 token 相同的双缓冲纪律 —— 同奇偶的上一次使用
+	// 已在两步前被 event 确认消费, 此刻 host/device 半区都是空闲的.
+	auto launch_fn = [&](const StepPlan &plan, int p) {
 		int nb = (int)plan.req_ids.size();
-		int p = calls++ & 1;
-		// 段尾行号: 复用与 token 相同的双缓冲纪律 —— 同奇偶的上一次使用
-		// 已在两步前被 event 确认消费, 此刻 host/device 半区都是空闲的
 		for (int b = 0, acc = 0; b < nb; ++b) { acc += plan.lens[b]; h_rows[p * B + b] = acc - 1; }
 		auto c1 = std::chrono::steady_clock::now();
 		cudaEventRecord(ev_start[step]);
@@ -144,37 +114,26 @@ int main() {
 		eng.forward(plan.slots.data(), nb, plan.lens.data(), dq, dk, dv, dout);
 		fake_sample<<<nb, 1>>>(d_tok + p * B, dout, QS, d_rows + p * B);
 		cudaMemcpyAsync(h_tok + p * B, d_tok + p * B, nb * sizeof(int), cudaMemcpyDeviceToHost);
-		cudaEventRecord(ev_tok[p]);
 		cudaEventRecord(ev_end[step]);
-		double dt_engine = us_since(c1);
-
-		// 消费第 N 步: 只等它的 token event, 此刻 GPU 正在跑第 N+1 步
-		double dt_wait = 0, dt_update = 0;
-		if (!inflight.empty()) {
-			int q = 1 - p;
-			auto c2 = std::chrono::steady_clock::now();
-			cudaEventSynchronize(ev_tok[q]);
-			dt_wait = us_since(c2);
-			auto c3 = std::chrono::steady_clock::now();
-			// 先 flush 后 update, 顺序即不变量: 队列里躺着第 N-1 步的死者,
-			// 它们最后被第 N 步引用, 而第 N 步刚被 event 确认完成 → 归还安全.
-			// update(N) 的新死者还被在途的第 N+1 步引用着, 留到下一拍.
-			sched.flush_release();
-			finished += (int)sched.update(inflight,
-				std::vector<int>(h_tok + q * B, h_tok + q * B + inflight.req_ids.size())).size();
-			dt_update = us_since(c3);
-		}
-		inflight = plan;
+		dt_engine = us_since(c1);
 		rows += nb;
+	};
+	auto on_done = [&](std::vector<Request> &&done) { finished += (int)done.size(); };
+	PipelineDriver drv(sched, h_tok, B, launch_fn, on_done);
+	auto wall0 = std::chrono::steady_clock::now();
+	while (true) {
+		PipelineDriver::Pump r = drv.pump();
+		if (r == PipelineDriver::Pump::IDLE) break;
+		if (r != PipelineDriver::Pump::LAUNCHED) continue;	// 排空拍不计时
 		if (step >= WARMUP) {
-			t_sched.push_back(dt_sched);
+			const auto &t = drv.last_times();
+			t_sched.push_back(t.sched_us);
 			t_engine.push_back(dt_engine);
-			t_wait.push_back(dt_wait);
-			t_update.push_back(dt_update);
+			t_wait.push_back(t.wait_us);
+			t_update.push_back(t.update_us);
 		}
 		++step;
 	}
-	drain();					// 循环因 plan 空退出时 inflight 必已空, 兜底而已
 	double wall_ms = us_since(wall0) / 1000.0;
 	cudaError_t err = cudaGetLastError();
 	if (err != cudaSuccess) { printf("CUDA error: %s\n", cudaGetErrorString(err)); return 1; }
@@ -223,8 +182,6 @@ int main() {
 		cudaEventDestroy(ev_start[i]);
 		cudaEventDestroy(ev_end[i]);
 	}
-	cudaEventDestroy(ev_tok[0]);
-	cudaEventDestroy(ev_tok[1]);
 	cudaFreeHost(h_base);
 	cudaFreeHost(h_tok);
 	cudaFreeHost(h_rows);

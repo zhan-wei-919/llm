@@ -55,7 +55,7 @@ int main() {
 	Tensor *q = llm.arena().alloc({TOKENS, QS}, Dtype::F32);
 	Tensor *k = llm.arena().alloc({TOKENS, KS}, Dtype::F32);
 	Tensor *v = llm.arena().alloc({TOKENS, KS}, Dtype::F32);
-	PagedAttention<float> attention(llm, engine, q, k, v, /*layer=*/0, "attention");
+	PagedAttention<float> attention(llm, engine, q, k, v, /*layer=*/0);
 	llm.finalize();
 
 	std::vector<float> h_q(TOKENS * QS, 0.0f);

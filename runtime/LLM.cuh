@@ -2,6 +2,9 @@
 #include <cuda_runtime.h>
 #include <vector>
 #include <unordered_map>
+#include <initializer_list>
+#include <string>
+#include <utility>
 #include "../tensor/Arena.cuh"
 #include "OpRecord.h"
 
@@ -34,9 +37,18 @@ public:
 	LLM &operator=(const LLM &) = delete;
 
 	Arena &arena() {return arena_;}
+	Tensor *parameter(std::string name, std::initializer_list<int> shape, Dtype dtype) {
+		Tensor *tensor = arena_.alloc(shape, dtype);
+		parameters_.emplace(std::move(name), tensor);
+		return tensor;
+	}
+	const std::unordered_map<std::string, Tensor *> &parameters() const {return parameters_;}
+	cudaStream_t stream() const {return stream_;}
+
 	void forward(const GraphShape &shape) {
 		auto it = graphs_.find(shape);
 		if (it == graphs_.end()) {
+			cudaStreamSynchronize(stream_);
 			auto exec = bake(shape);
 			it = graphs_.emplace(shape, exec).first;
 		}
@@ -47,12 +59,13 @@ public:
 
 private:
 	template<typename T>
-	void append(std::string name, T &module) {
-		program_.emplace_back(std::move(name), module);
+	void append(T &module) {
+		program_.emplace_back(module);
 	}
 
 	Arena arena_;
 	std::vector<OpRecord> program_;
+	std::unordered_map<std::string, Tensor *> parameters_;
 	cudaStream_t stream_;
 	std::unordered_map<GraphShape, cudaGraphExec_t, GraphShapeHash> graphs_;
 

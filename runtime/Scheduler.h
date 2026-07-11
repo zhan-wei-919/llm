@@ -85,6 +85,7 @@ public:
 			p.slots.push_back(r.slot);
 			p.lens.push_back(1);
 			p.starts.push_back(pool_.seq_len(r.slot));
+			p.ids.push_back(r.token_ids.back());
 			batched_tokens += 1;
 			int len = pool_.seq_len(r.slot);
 			if (len % KV_BLOCK_SIZE == 0)       promissed_blocks++;	// 本步 append 就要新块

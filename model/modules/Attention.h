@@ -18,8 +18,8 @@ public:
 	: q_proj_(llm, input, max_tokens, hidden_dim, engine.qkv_size()[0] * engine.qkv_size()[2], qkv_has_bias, prefix + ".q_proj")
 	, k_proj_(llm, input, max_tokens, hidden_dim, engine.qkv_size()[1] * engine.qkv_size()[2], qkv_has_bias, prefix + ".k_proj")
 	, v_proj_(llm, input, max_tokens, hidden_dim, engine.qkv_size()[1] * engine.qkv_size()[2], qkv_has_bias, prefix + ".v_proj")
-	, rope_(llm, engine, q_proj_.out(), k_proj_.out(), prefix + ".rope")
-	, paged_attention_(llm, engine, q_proj_.out(), k_proj_.out(), v_proj_.out(), layer, prefix + ".attn")
+	, rope_(llm, engine, q_proj_.out(), k_proj_.out())
+	, paged_attention_(llm, engine, q_proj_.out(), k_proj_.out(), v_proj_.out(), layer)
 	, o_proj_(llm, paged_attention_.out(), max_tokens, engine.qkv_size()[0] * engine.qkv_size()[2], hidden_dim, o_has_bias, prefix + ".o_proj"){}
 
 	Tensor *out() {return o_proj_.out();}

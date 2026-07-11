@@ -7,10 +7,10 @@
 template<typename T>
 class SwiMul : public Module {
 public:
-	SwiMul(LLM &llm, Tensor *gate, Tensor *up, int max_tokens, int proj_dim, std::string prefix)
-	: gate_(gate), up_(up), proj_dim_(proj_dim), prefix_(prefix) {
+	SwiMul(LLM &llm, Tensor *gate, Tensor *up, int max_tokens, int proj_dim)
+	: gate_(gate), up_(up), proj_dim_(proj_dim) {
 		out_ = llm.arena().alloc({max_tokens, proj_dim_}, dtype_of<T>::value);
-		attach(llm, prefix_, *this);
+		attach(llm, *this);
 	}
 
 	void forward(const GraphShape &shape, cudaStream_t stream) {
@@ -26,5 +26,4 @@ public:
 private:
 	Tensor *gate_, *up_, *out_;
 	int proj_dim_;
-	std::string prefix_;
 };

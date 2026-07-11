@@ -18,10 +18,10 @@ public:
 		bool qkv_has_bias, bool o_has_boas, bool fc_has_bias, float eps, std::string prefix)
 	: ln1_(llm, input, max_tokens, hidden_dim, eps, prefix + ".ln1")
 	, attn_(llm, engine, ln1_.out(), max_tokens, hidden_dim, layer, qkv_has_bias, o_has_boas, prefix + ".attn")
-	, r1_(llm, input, attn_.out(), max_tokens, hidden_dim, prefix + ".r1")
+	, r1_(llm, input, attn_.out(), max_tokens, hidden_dim)
 	, ln2_(llm, r1_.out(), max_tokens, hidden_dim, eps, prefix + ".ln2")
 	, fc_(llm, ln2_.out(), max_tokens, hidden_dim, fc_proj_dim, fc_has_bias, prefix + ".fc")
-	, r2_(llm, r1_.out(), fc_.out(),  max_tokens, hidden_dim, prefix + ".r2") {}
+	, r2_(llm, r1_.out(), fc_.out(),  max_tokens, hidden_dim) {}
 
 	Tensor *out() {return r2_.out();}
 private:

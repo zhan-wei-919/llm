@@ -9,7 +9,7 @@ public:
 	MLP(LLM &llm, Tensor *input, int max_tokens, int hidden_dim, int proj_dim, bool has_bias, const std::string &prefix)
 	: gate_proj_(llm, input, max_tokens, hidden_dim, proj_dim, has_bias, prefix + ".gate_proj")
 	, up_proj_(llm, input, max_tokens, hidden_dim, proj_dim, has_bias, prefix + ".up_proj")
-	, swi_mul_(llm, gate_proj_.out(), up_proj_.out(), max_tokens, proj_dim, prefix + ".swi_mul")
+	, swi_mul_(llm, gate_proj_.out(), up_proj_.out(), max_tokens, proj_dim)
 	, down_proj_(llm, swi_mul_.out(), max_tokens, proj_dim, hidden_dim, has_bias, prefix + ".down_proj") {}
 
 	Tensor *out() {return down_proj_.out();}

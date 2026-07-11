@@ -7,10 +7,10 @@
 template<typename T>
 class Residual : public Module {
 public:
-	Residual(LLM &llm, Tensor *x1, Tensor *x2, int max_tokens, int hidden_dim, std::string prefix)
-	:x1_(x1), x2_(x2), hidden_dim_(hidden_dim), prefix_(prefix) {
+	Residual(LLM &llm, Tensor *x1, Tensor *x2, int max_tokens, int hidden_dim)
+	:x1_(x1), x2_(x2), hidden_dim_(hidden_dim) {
 		out_ = llm.arena().alloc({max_tokens, hidden_dim_}, dtype_of<T>::value);
-		attach(llm, prefix_, *this);
+		attach(llm, *this);
 	}
 
 	void forward(const GraphShape &shape, cudaStream_t stream) {
@@ -25,5 +25,4 @@ public:
 private:
 	Tensor *x1_, *x2_, *out_;
 	int hidden_dim_;
-	std::string prefix_;
 };

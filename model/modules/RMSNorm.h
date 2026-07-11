@@ -8,10 +8,10 @@ template<typename T>
 class RMSNorm : public Module {
 public:
 	RMSNorm(LLM &llm, Tensor *input, int max_tokens, int hiddem_dim, float eps, std::string prefix)
-	: input_(input), hidden_dim_(hiddem_dim), eps_(eps), prefix_(prefix) {
-		weight_ = llm.arena().alloc({hidden_dim_}, dtype_of<T>::value);
+	: input_(input), hidden_dim_(hiddem_dim), eps_(eps) {
+		weight_ = llm.parameter(prefix + ".weight", {hidden_dim_}, dtype_of<T>::value);
 		out_ = llm.arena().alloc({max_tokens, hidden_dim_}, dtype_of<T>::value);
-		attach(llm, prefix_, *this);
+		attach(llm, *this);
 	}
 
 	void forward(const GraphShape &shape, cudaStream_t stream) {
@@ -27,5 +27,4 @@ private:
 	Tensor *input_, *weight_, *out_;
 	int hidden_dim_;
 	float eps_;
-	std::string prefix_;
 };

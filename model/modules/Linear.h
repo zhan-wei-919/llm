@@ -10,11 +10,11 @@ template<typename T>
 class Linear : public Module {
 public:
 	Linear(LLM &llm, Tensor *input, int max_tokens, int in_channel, int out_channel, bool has_bias, std::string prefix)
-	: input_(input), in_channel_(in_channel), out_channel_(out_channel), has_bias_(has_bias), prefix_(prefix){
-		weight_ = llm.arena().alloc({in_channel_, out_channel_}, dtype_of<T>::value);
+	: input_(input), in_channel_(in_channel), out_channel_(out_channel), has_bias_(has_bias){
+		weight_ = llm.parameter(prefix + ".weight", {in_channel_, out_channel_}, dtype_of<T>::value);
 		out_ = llm.arena().alloc({max_tokens, out_channel_}, dtype_of<T>::value);
-		bias_ = has_bias_? llm.arena().alloc({out_channel_}, dtype_of<T>::value) : nullptr;
-		attach(llm, prefix_, *this);
+		bias_ = has_bias_? llm.parameter(prefix + ".bias", {out_channel_}, dtype_of<T>::value) : nullptr;
+		attach(llm, *this);
 	}
 
 	void forward(const GraphShape &shape, cudaStream_t stream) {
@@ -41,5 +41,4 @@ private:
 	Tensor *input_, *weight_, *bias_, *out_;
 	int in_channel_, out_channel_;
 	bool has_bias_;
-	std::string prefix_;
 };

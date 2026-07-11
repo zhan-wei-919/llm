@@ -8,8 +8,8 @@
 template<typename T>
 class RoPE : public Module {
 public:
-	RoPE(LLM &llm, Engine &engine, Tensor *q, Tensor *k, std::string prefix)
-	: engine_(engine), q_(q), k_(k), prefix_(prefix){attach(llm, prefix_, *this);}
+	RoPE(LLM &llm, Engine &engine, Tensor *q, Tensor *k)
+	: engine_(engine), q_(q), k_(k){attach(llm, *this);}
 
 	void forward(const GraphShape &, cudaStream_t stream) {
 		const float *cos_table = static_cast<const float*>(engine_.cos_table()->ptr);
@@ -21,5 +21,4 @@ public:
 private:
 	Engine &engine_;
 	Tensor *q_, *k_;
-	std::string prefix_;
 };

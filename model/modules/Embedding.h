@@ -9,10 +9,10 @@ class Embedding : public Module {
 public:
 	Embedding(LLM &llm, Tensor *token_ids, int max_tokens,
 	          int vocab_size, int hidden_dim, std::string prefix)
-	: token_ids_(token_ids), hidden_dim_(hidden_dim), prefix_(std::move(prefix)) {
-		weight_ = llm.arena().alloc({vocab_size, hidden_dim}, dtype_of<T>::value);
+	: token_ids_(token_ids), hidden_dim_(hidden_dim) {
+		weight_ = llm.parameter(prefix + ".weight", {vocab_size, hidden_dim}, dtype_of<T>::value);
 		out_ = llm.arena().alloc({max_tokens, hidden_dim}, dtype_of<T>::value);
-		attach(llm, prefix_, *this);
+		attach(llm, *this);
 	}
 
 	void forward(const GraphShape &shape, cudaStream_t stream) {
@@ -32,5 +32,4 @@ public:
 private:
 	Tensor *token_ids_, *weight_, *out_;
 	int hidden_dim_;
-	std::string prefix_;
 };

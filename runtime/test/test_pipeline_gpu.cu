@@ -15,7 +15,7 @@
 // 块给足, 不触发抢占 (抢占时机在两种模式下合法不同, 会让差分失义).
 //
 // 编译: nvcc -O2 -arch=native test_pipeline_gpu.cu -o /tmp/test_pipeline_gpu
-#include "../Engine.cuh"
+#include "../Engine.h"
 #include "../Scheduler.h"
 #include "../Driver.h"
 #include <cstdio>
@@ -94,15 +94,18 @@ static void launch_step(Ctx &c, Engine &eng, const StepPlan &plan,
 	cudaMemcpyAsync(c.d_pos + off_rows, c.h_pos + off_rows, total * sizeof(int), cudaMemcpyHostToDevice, c.t);
 	cudaMemcpyAsync(c.d_rows + off_tok, c.h_rows + off_tok, nb * sizeof(int), cudaMemcpyHostToDevice, c.t);
 	fill_qkv<<<total, 128, 0, c.t>>>(c.dq, c.dk, c.dv, c.d_rid + off_rows, c.d_pos + off_rows);
-	eng.forward(plan.slots.data(), nb, plan.lens.data(), c.dq, c.dk, c.dv, c.dout, c.t);
+	eng.prepare(plan.slots.data(), nb, plan.lens.data(), c.t);
+	eng.forward_layer(0, c.dq, c.dk, c.dv, c.dout, c.t);
 	fake_sample<<<nb, 1, 0, c.t>>>(c.d_tok + off_tok, c.dout, QS, c.d_rows + off_tok);
 	cudaMemcpyAsync(c.h_tok + off_tok, c.d_tok + off_tok, nb * sizeof(int), cudaMemcpyDeviceToHost, c.t);
 }
 
 // 同一个 driver, 两种用法; pipelined=false 即同步 oracle
 static std::vector<std::vector<int>> run(Ctx &c, bool pipelined) {
-	KV_Pool pool(c.k_base, c.v_base, Dtype::F32, KS, c.kv_bytes, MAX_SEQS, MAX_SEQ_LEN);
-	Engine eng(pool, NH, NKV, HS, c.d_meta, c.h_meta);
+	KV_Pool pool(c.k_base, c.v_base, Dtype::F32, KS, c.kv_bytes, 1, MAX_SEQS, MAX_SEQ_LEN);
+	Arena arena(/*max_tensors=*/2);
+	Engine eng(arena, pool, NH, NKV, HS, c.d_meta, c.h_meta);
+	arena.finalize();
 	Scheduler sched(pool, {MAX_SEQS, BUDGET, /*eos=*/-1});
 	for (int i = 0; i < NREQ; ++i)
 		sched.add_request(std::vector<int>(PROMPT_LEN[i], i), MAX_NEW[i]);

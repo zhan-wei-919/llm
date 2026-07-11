@@ -23,8 +23,7 @@ static void engine_append(KV_Pool &pool, const StepPlan &plan) {
 
 static KV_Pool make_pool(int num_blocks, int max_seqs, int max_seq_len) {
 	// kv_stride=1, F16(2字节) → 每块 32 字节, capacity 反推出想要的块数
-	return KV_Pool(nullptr, nullptr, Dtype::F16, 1,
-	               (size_t)num_blocks * KV_BLOCK_SIZE * 2, max_seqs, max_seq_len);
+	return KV_Pool(nullptr, nullptr, Dtype::F16, 1, (size_t)num_blocks * KV_BLOCK_SIZE * 2, 1, max_seqs, max_seq_len);
 }
 
 static void test_single_long_prompt() {

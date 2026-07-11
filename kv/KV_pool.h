@@ -12,9 +12,10 @@
 // 每行的已用块数不单独存, 由不变量 块数 == ceil(len/16) 从 len_ 反推.
 class KV_Pool {
 public:
-	KV_Pool(void *k_base, void *v_base, Dtype d, size_t kv_stride, size_t capacity,int max_seqs, int max_seq_len)
-	: k_base_(k_base), v_base_(v_base), dtype_(d), kv_stride_(kv_stride)
-	, num_blocks_(capacity / (KV_BLOCK_SIZE * kv_stride * dtype_size(d)))
+	KV_Pool(void *k_base, void *v_base, Dtype d, size_t kv_stride, size_t capacity, int num_layers, int max_seqs, int max_seq_len)
+	: k_base_(k_base), v_base_(v_base), dtype_(d), kv_stride_(kv_stride), num_layers_(num_layers)
+	, num_blocks_(capacity / ((size_t)num_layers * KV_BLOCK_SIZE * kv_stride * dtype_size(d)))
+	, layer_bytes_(num_blocks_ * KV_BLOCK_SIZE * kv_stride_ * dtype_size(d))
 	, max_seqs_(max_seqs)
 	, max_blocks_per_seq_((max_seq_len + KV_BLOCK_SIZE - 1) / KV_BLOCK_SIZE)
 	, block_table_((size_t)max_seqs * max_blocks_per_seq_)
@@ -69,8 +70,10 @@ public:
 		}
 	}
 
-	void *k_base() const { return k_base_; }
-	void *v_base() const { return v_base_; }
+	void *k_base(int layer) const {return  static_cast<void*>(static_cast<char*>(k_base_) +(size_t)(layer) * layer_bytes_);}
+
+	void *v_base(int layer) const {return static_cast<void*>(static_cast<char*>(v_base_) + (size_t)(layer) * layer_bytes_);}
+
 	int seq_len(int slot) const { return len_[slot]; }
 	int max_seqs() const { return max_seqs_; }
 	int max_blocks_per_seq() const { return max_blocks_per_seq_; }
@@ -83,7 +86,9 @@ private:
 	void *const v_base_;
 	const Dtype dtype_;
 	const size_t kv_stride_;
+	const int num_layers_;
 	const size_t num_blocks_;
+	const size_t layer_bytes_;
 	const int max_seqs_;
 	const int max_blocks_per_seq_;
 	std::vector<int> block_table_;	// [max_seqs, max_blocks_per_seq] 稠密页表

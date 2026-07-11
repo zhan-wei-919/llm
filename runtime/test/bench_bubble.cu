@@ -1,7 +1,8 @@
-#include "../Engine.cuh"
+#include "../Engine.h"
 #include "../Scheduler.h"
 #include "../Driver.h"
 #include "../../tensor/Arena.cuh"
+#include "../GraphShape.h"
 #include <cstdio>
 #include <vector>
 #include <chrono>
@@ -61,17 +62,18 @@ int main() {
 	int W = (MAX_SEQ_LEN + KV_BLOCK_SIZE - 1) / KV_BLOCK_SIZE;
 	int L = W * KV_BLOCK_SIZE;
 	int meta_ints = B * W + B + B + B * L + (B + 1);
-	Arena a(4);
-	Tensor *t_meta = a.alloc({meta_ints}, Dtype::F32);
-	a.finalize();
+	Arena a(/*max_tensors=*/2); // Engine 共享 cos/sin table
+	int *d_meta;
+	cudaMalloc(&d_meta, (size_t)meta_ints * sizeof(int));
 	int *h_base;					// 2 份: Engine 按 decode 步的奇偶轮换写入
 	cudaHostAlloc(&h_base, (size_t)2 * meta_ints * sizeof(int), 0);
 	size_t kv_bytes = (size_t)BLOCKS * KV_BLOCK_SIZE * KS * sizeof(float);
 	void *k_base, *v_base;
 	cudaMalloc(&k_base, kv_bytes);
 	cudaMalloc(&v_base, kv_bytes);
-	KV_Pool pool(k_base, v_base, Dtype::F32, KS, kv_bytes, B, MAX_SEQ_LEN);
-	Engine eng(pool, NH, NKV, HS, (int *)t_meta->ptr, h_base);
+	KV_Pool pool(k_base, v_base, Dtype::F32, KS, kv_bytes, 1, B, MAX_SEQ_LEN);
+	Engine eng(a, pool, NH, NKV, HS, d_meta, h_base);
+	a.finalize();
 	Scheduler sched(pool, {/*max_num_seqs=*/B, /*max_num_batched_tokens=*/B * PROMPT_LEN, /*eos=*/-1});
 
 	// 激活常驻 device, 内容填一次伪随机即可 (attention 耗时与数值无关)
@@ -113,7 +115,8 @@ int main() {
 		auto c1 = std::chrono::steady_clock::now();
 		cudaEventRecord(ev_start[step], t);
 		cudaMemcpyAsync(d_rows + p * B, h_rows + p * B, nb * sizeof(int), cudaMemcpyHostToDevice, t);
-		eng.forward(plan.slots.data(), nb, plan.lens.data(), dq, dk, dv, dout, t);
+		GraphShape shape = eng.prepare(plan.slots.data(), nb, plan.lens.data(), t);
+		eng.forward_layer(0, dq, dk, dv, dout, t);
 		fake_sample<<<nb, 1, 0, t>>>(d_tok + p * B, dout, QS, d_rows + p * B);
 		cudaMemcpyAsync(h_tok + p * B, d_tok + p * B, nb * sizeof(int), cudaMemcpyDeviceToHost, t);
 		cudaEventRecord(ev_end[step], t);
@@ -188,6 +191,7 @@ int main() {
 	cudaFreeHost(h_tok);
 	cudaFreeHost(h_rows);
 	cudaFree(k_base); cudaFree(v_base);
+	cudaFree(d_meta);
 	cudaFree(dq); cudaFree(dk); cudaFree(dv); cudaFree(dout);
 	cudaFree(d_tok); cudaFree(d_rows);
 	cudaStreamDestroy(t);

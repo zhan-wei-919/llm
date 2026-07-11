@@ -1,8 +1,13 @@
 #pragma once
 #include <cuda_runtime.h>
 #include "../kv/KV_pool.h"
+#include "../tensor/Tensor.h"
+#include "../tensor/Arena.cuh"
 #include "../kernel/attention/Scatter_kv.cuh"
 #include "../kernel/attention/GQAttention_prefill.cuh"
+#include "../kernel/embedding/RoPECache.cuh"
+#include "../kernel/embedding/RoPE.cuh"
+#include "GraphShape.h"
 
 // Engine: 把"一步推理"翻译成固定的操作序列
 //   记账 (调 pool) → 收集 (gather_tables) → 搬运 (memcpy 上传) → 发射 (kernel)
@@ -19,8 +24,8 @@ public:
 	// pos:        S           个 int
 	// seq_ids:    S * L       个 int   (最坏情况)
 	// cu_seqlens: S + 1       个 int
-	Engine(KV_Pool &pool, int NH, int NKV, int HS, int *d_base, int *h_base)
-	: pool_(pool), NH_(NH), NKV_(NKV), HS_(HS), d_base_(d_base), h_base_(h_base) {
+	Engine(Arena &arena, KV_Pool &pool, int NH, int NKV, int HS, int *d_base, int *h_base)
+	: arena_(arena) , pool_(pool), NH_(NH), NKV_(NKV), HS_(HS), d_base_(d_base), h_base_(h_base) {
 		int S = pool.max_seqs();
 		int W = pool.max_blocks_per_seq();
 		int L = pool.max_blocks_per_seq() * KV_BLOCK_SIZE;
@@ -32,41 +37,71 @@ public:
 		h_half_[0] = h_base;
 		h_half_[1] = h_base + total_ints_;
 		select_half(0);
+		cos_ = arena_.alloc({L, HS / 2}, Dtype::F32);
+		sin_ = arena_.alloc({L, HS / 2}, Dtype::F32);
 	}
 
 	int alloc_seq() { return pool_.alloc_seq(); }
 	void release(int slot) { pool_.release(slot); }
 
-	// forward: 混合批的统一一步. 本批 B 条序列首尾相接打包, lens[b] 是第 b 条本步
-	// 要算的 token 数 —— decode 条目为 1, 追赶 chunk 为一段, 同一次发射混装.
-	// q: [total, NH*HS], k/v: [total, NKV*HS] 稠密激活, out: [total, NH*HS]
-	// scatter 先把本步 k/v 写进 pool, attention 经页表读 [0, pos+i] 的全部前缀
-	void forward(const int *slots, int B, const int *lens, const void *q, const void *k, const void *v, void *out, cudaStream_t t) {
+	GraphShape prepare(const int *slots, int B, const int *lens, cudaStream_t stream) {
+		current_B_ = B;
 		select_half(step_++ & 1);
-		int W = pool_.max_blocks_per_seq();
 		h_cu_seqlens_[0] = 0;
 		for (int b = 0; b < B; ++b) {
 			h_pos_[b] = pool_.append(slots[b], lens[b]);
 			h_cu_seqlens_[b + 1] = h_cu_seqlens_[b] + lens[b];
 		}
-		int total = h_cu_seqlens_[B];
+		current_total_ = h_cu_seqlens_[B];
 		pool_.gather_tables(slots, B, h_table_, h_len_);
 		for (int b = 0, t = 0; b < B; ++b)			// 展开: 第 b 段的 lens[b] 行都属于 b
 			for (int i = 0; i < lens[b]; ++i) h_seq_ids_[t++] = b;
-		upload(t);
+		upload(stream);
+		return {current_B_, current_total_};
+	}
+
+	// forward: 混合批的统一一步. 本批 B 条序列首尾相接打包, lens[b] 是第 b 条本步
+	// 要算的 token 数 —— decode 条目为 1, 追赶 chunk 为一段, 同一次发射混装.
+	// q: [total, NH*HS], k/v: [total, NKV*HS] 稠密激活, out: [total, NH*HS]
+	// scatter 先把本步 k/v 写进 pool, attention 经页表读 [0, pos+i] 的全部前缀
+	void forward_layer(int layer, const void *q, const void *k, const void *v, void *out, cudaStream_t stream){
+		auto k_base = pool_.k_base(layer);
+		auto v_base = pool_.v_base(layer);
+		int W = pool_.max_blocks_per_seq();
 		dtype_dispatch(pool_.dtype(), [&](auto tag) {
 			using T_ = typename decltype(tag)::type;
 			launch_scatter_kv<T_>(
-				(T_ *)pool_.k_base(), (T_ *)pool_.v_base(),
+				(T_ *)k_base, (T_ *)v_base,
 				(const T_ *)k, (const T_ *)v,
 				d_table_, d_cu_seqlens_, d_seq_ids_, d_pos_,
-				total, NKV_, HS_, W, t);
+				current_total_, NKV_, HS_, W, stream);
 			launch_gq_attention_prefill<T_>(
-				(T_ *)out, (const T_ *)q, (const T_ *)pool_.k_base(), (const T_ *)pool_.v_base(),
+				(T_ *)out, (const T_ *)q, (const T_ *)k_base, (const T_ *)v_base,
 				d_cu_seqlens_, d_seq_ids_, d_pos_, d_table_,
-				B, NH_, NKV_, HS_, W, total, t);
+				current_B_, NH_, NKV_, HS_, W, current_total_, stream);
 		});
 	}
+
+	void apple_rope(void *q, void *k, const float *cos_table, const float *sin_table, cudaStream_t stream){
+		dtype_dispatch(pool_.dtype(), [&](auto tag){
+			using T = typename decltype(tag)::type;
+			launch_rope(static_cast<T*>(q), cos_table, sin_table, d_cu_seqlens_, d_seq_ids_, d_pos_, current_total_, NH_, HS_, stream);
+			launch_rope(static_cast<T*>(k), cos_table, sin_table, d_cu_seqlens_, d_seq_ids_, d_pos_, current_total_, NKV_, HS_, stream);
+		});
+	}
+
+	void init_rope(cudaStream_t stream, float base = 10000.0f) {
+		int total = pool_.max_blocks_per_seq() * KV_BLOCK_SIZE * (HS_ / 2);
+		int block = 256;
+		int grid = (total + block - 1) / block;
+		float *cos_table = static_cast<float*>(cos_->ptr);
+		float *sin_table = static_cast<float*>(sin_->ptr);
+		init_rope_table<<<grid, block, 0, stream>>>(cos_table, sin_table, total, HS_, base);
+	}
+
+	Tensor *cos_table() {return cos_;}
+	Tensor *sin_table() {return sin_;}
+	std::vector<int> qkv_size() {return {NH_, NKV_, HS_};}
 
 private:
 	void upload(cudaStream_t t) {
@@ -86,12 +121,17 @@ private:
 	}
 
 	KV_Pool	&pool_;
+	Arena &arena_;
 	const int NH_, NKV_, HS_;
 	size_t total_ints_ = 0;
 	int *d_base_, *h_base_;
 	int *d_table_, *d_len_, *d_pos_, *d_seq_ids_, *d_cu_seqlens_;
 	int *h_table_, *h_len_, *h_pos_, *h_seq_ids_, *h_cu_seqlens_;
 
+	Tensor *cos_, *sin_;
+
 	int *h_half_[2];
 	int step_ = 0;
+	int current_B_ = 0;
+	int current_total_ = 0;
 };

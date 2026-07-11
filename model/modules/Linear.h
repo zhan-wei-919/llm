@@ -34,6 +34,8 @@ public:
 	};
 
 	Tensor *out() {return out_;}
+	Tensor *weight() {return weight_;}
+	Tensor *bias() {return bias_;}
 
 private:
 	Tensor *input_, *weight_, *bias_, *out_;

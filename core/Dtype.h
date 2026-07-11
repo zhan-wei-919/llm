@@ -38,6 +38,7 @@ decltype(auto) dtype_dispatch(Dtype d, F &&f) {
 		case Dtype::F32: return f(TypeTag<float>{});
 		case Dtype::BF16: return f(TypeTag<__nv_bfloat16>{});
 		case Dtype::F16: return f(TypeTag<half>{});
+		case Dtype::I32: return f(TypeTag<int>{});
 	}
 	__builtin_trap();
 }

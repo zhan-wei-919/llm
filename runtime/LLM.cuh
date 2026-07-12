@@ -10,6 +10,11 @@
 #include <utility>
 #include "../tensor/Arena.cuh"
 #include "../utils/safetensor_loader.h"
+#include "Engine.h"
+#include "../kv/KV_pool.h"
+#include "../tensor/Tensor.h"
+#include "Scheduler.h"
+#include "../tokenizer/llama_tokenizer.h"
 #include "OpRecord.h"
 
 inline constexpr uint64_t SAFETENSOR_LOAD_BUFFER_BYTES = 1ull << 30;

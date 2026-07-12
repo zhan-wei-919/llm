@@ -78,9 +78,11 @@ public:
 		int decode_reserve = 0;		// 本步 +1 后, 下一步 decode 踩线的序列数
 		for (int id : running_) {
 			Request &r = requests_.at(id);
-			int generated = (int)r.token_ids.size() - r.prompt_len + r.in_flight;
-			if (generated >= r.max_new_tokens) continue;
-			r.in_flight++;
+			// int generated = (int)r.token_ids.size() - r.prompt_len + r.in_flight;
+			// if (generated >= r.max_new_tokens) continue;
+			// r.in_flight++;
+			if (!decode_ready(r)) continue;
+			r.in_flight = 1;
 			p.req_ids.push_back(id);
 			p.slots.push_back(r.slot);
 			p.lens.push_back(1);
@@ -213,12 +215,25 @@ private:
 		return (len + KV_BLOCK_SIZE - 1) / KV_BLOCK_SIZE;
 	}
 
+	// in_flight 可以用于提前计算将来总共会生成几个 token, 但是没法提供未来的token是什么
+	// [100, 64]发出后, in_flight = 1, 此时GPU在计算下一个token
+	// 但是step 3还没回到CPU, 而这是不应该再继续投机了, 因为这时的投机还是用[100, 64]重新发送, 没法预测第三个是什么
+	// 也就是说必须保证in_flight不能增长到2, 一个Request最多只能投机一次, 而这次就必须等到投机的请求回来, 这时候就应该去解决区域的请求来填补气泡
+	bool decode_ready(const Request &r) const {
+		int generated = (int)r.token_ids.size() - r.prompt_len;
+		return r.in_flight == 0 && generated < r.max_new_tokens;
+	}
+
 	// decode 一步的块需求可以精确算出: 只有 len 恰好踩在块边界上的序列
 	// 这一步才需要新块. 不够就抢占, 直到需求被余额盖住.
+	// 但正在 in_flight 的请求这一步不会 decode, 所以不应该算作本次立即需要的 block
 	int decode_blocks_needed() const {
 		int need = 0;
-		for (int id : running_)
+		for (int id : running_){
+			const Request &r = requests_.at(id);
+			if (!decode_ready(r)) continue;
 			if (pool_.seq_len(requests_.at(id).slot) % KV_BLOCK_SIZE == 0) ++need;
+		}
 		return need;
 	}
 

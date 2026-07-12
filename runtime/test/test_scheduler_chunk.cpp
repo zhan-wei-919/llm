@@ -171,10 +171,50 @@ static void test_chunks_schedule_ahead() {
 	printf("test_chunks_schedule_ahead PASS\n");
 }
 
+// 精准自回归约束: 同一请求的上一个 decode 结果尚未 update 时，
+// token_ids.back() 仍是旧 token，不能再次为它排定 decode。
+static void test_decode_waits_for_previous_token() {
+	const int NB = 100;
+	KV_Pool pool = make_pool(NB, /*max_seqs=*/4, /*max_seq_len=*/256);
+	Scheduler sched(pool, {/*max_num_seqs=*/4, /*max_num_batched_tokens=*/32, /*eos=*/-1});
+	sched.add_request(/*prompt=*/{7}, /*max_new_tokens=*/3);
+
+	// prefill: 输入 prompt token 7，产生第一个生成 token 100。
+	StepPlan prefill = sched.schedule();
+	assert(prefill.ids == std::vector<int>{7});
+	engine_append(pool, prefill);
+	assert(sched.update(prefill, {100}).empty());
+
+	// 第一次 decode: 输入刚生成的 token 100；结果尚未 update。
+	StepPlan d1 = sched.schedule();
+	assert(d1.ids == std::vector<int>{100});
+	engine_append(pool, d1);
+
+	// d1 仍在途，CPU 只知道旧 token 100，因此同一请求必须暂时不可调度。
+	StepPlan blocked = sched.schedule();
+	assert(blocked.empty());
+
+	// d1 完成并提交 token 101 后，下一次 decode 才能以 101 为输入。
+	assert(sched.update(d1, {101}).empty());
+	StepPlan d2 = sched.schedule();
+	assert(d2.ids == std::vector<int>{101});
+	engine_append(pool, d2);
+
+	auto done = sched.update(d2, {102});
+	assert(done.size() == 1);
+	assert((done[0].token_ids == std::vector<int>{7, 100, 101, 102}));
+
+	sched.flush_release();
+	assert((int)pool.num_free_blocks() == NB);
+	assert((int)pool.num_free_slots() == 4);
+	printf("test_decode_waits_for_previous_token PASS\n");
+}
+
 int main() {
 	test_single_long_prompt();
 	test_two_prompts_share_budget();
 	test_chunks_schedule_ahead();
+	test_decode_waits_for_previous_token();
 	printf("all tests PASS\n");
 	return 0;
 }

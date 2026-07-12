@@ -30,19 +30,12 @@ int main() {
 	cudaMalloc(&k_base, capacity);
 	cudaMalloc(&v_base, capacity);
 
+	Arena arena(/*max_tensors=*/3); // Engine 在 finalize 前登记 meta/cos/sin
+	Engine engine(arena, NH, NKV, HS, MAX_SEQS, MAX_SEQ_LEN);
+	arena.finalize();
 	KV_Pool pool(k_base, v_base, Dtype::F32, KS, capacity,
 	             NUM_LAYERS, MAX_SEQS, MAX_SEQ_LEN);
-
-	constexpr int W = MAX_SEQ_LEN / KV_BLOCK_SIZE;
-	constexpr int L = W * KV_BLOCK_SIZE;
-	constexpr int META_INTS = MAX_SEQS * W + MAX_SEQS + MAX_SEQS
-	                        + MAX_SEQS * L + (MAX_SEQS + 1);
-	int *d_meta, *h_meta;
-	cudaMalloc(&d_meta, META_INTS * sizeof(int));
-	cudaHostAlloc(&h_meta, 2 * META_INTS * sizeof(int), 0);
-	Arena arena(/*max_tensors=*/2); // Engine 在 finalize 前登记共享 cos/sin table
-	Engine engine(arena, pool, NH, NKV, HS, d_meta, h_meta);
-	arena.finalize();
+	engine.bind_pool(&pool);
 
 	std::vector<float> h_q(TOKENS * QS, 0.0f);
 	std::vector<float> h_k0(TOKENS * KS, 1.0f);
@@ -93,7 +86,7 @@ int main() {
 	assert(pool.seq_len(slot) == TOKENS); // prepare 只记账一次
 
 	cudaFree(d_q); cudaFree(d_k0); cudaFree(d_v0); cudaFree(d_k1); cudaFree(d_v1);
-	cudaFree(d_out0); cudaFree(d_out1); cudaFree(d_meta); cudaFreeHost(h_meta);
+	cudaFree(d_out0); cudaFree(d_out1);
 	cudaFree(k_base); cudaFree(v_base); cudaStreamDestroy(stream);
 	printf("test_kv_pool_layers PASS\n");
 	return 0;

@@ -39,24 +39,16 @@ int main() {
 	void *k_base, *v_base;
 	check_cuda(cudaMalloc(&k_base, kv_bytes));
 	check_cuda(cudaMalloc(&v_base, kv_bytes));
-	KV_Pool pool(k_base, v_base, Dtype::F32, KS, kv_bytes,
-	             /*num_layers=*/1, MAX_SEQS, MAX_SEQ_LEN);
-
-	constexpr int W = MAX_SEQ_LEN / KV_BLOCK_SIZE;
-	constexpr int L = W * KV_BLOCK_SIZE;
-	constexpr int META_INTS = MAX_SEQS * W + MAX_SEQS + MAX_SEQS
-	                        + MAX_SEQS * L + (MAX_SEQS + 1);
-	int *d_meta, *h_meta;
-	check_cuda(cudaMalloc(&d_meta, META_INTS * sizeof(int)));
-	check_cuda(cudaHostAlloc(&h_meta, 2 * META_INTS * sizeof(int), 0));
-
-	LLM llm(/*max_tensors=*/6); // Engine cos/sin + q/k/v/out
-	Engine engine(llm.arena(), pool, NH, NKV, HS, d_meta, h_meta);
+	LLM llm(/*max_tensors=*/7); // Engine meta/cos/sin + q/k/v/out
+	Engine engine(llm.arena(), NH, NKV, HS, MAX_SEQS, MAX_SEQ_LEN);
 	Tensor *q = llm.arena().alloc({TOKENS, QS}, Dtype::F32);
 	Tensor *k = llm.arena().alloc({TOKENS, KS}, Dtype::F32);
 	Tensor *v = llm.arena().alloc({TOKENS, KS}, Dtype::F32);
 	PagedAttention<float> attention(llm, engine, q, k, v, /*layer=*/0);
 	llm.finalize();
+	KV_Pool pool(k_base, v_base, Dtype::F32, KS, kv_bytes,
+	             /*num_layers=*/1, MAX_SEQS, MAX_SEQ_LEN);
+	engine.bind_pool(&pool);
 
 	std::vector<float> h_q(TOKENS * QS, 0.0f);
 	std::vector<float> h_k(TOKENS * KS, 1.0f);
@@ -90,8 +82,6 @@ int main() {
 	check_output(h_out, {3.25f, 4.0f, 4.5f});
 	assert(pool.seq_len(slot) == 2 * TOKENS);
 
-	check_cuda(cudaFree(d_meta));
-	check_cuda(cudaFreeHost(h_meta));
 	check_cuda(cudaFree(k_base));
 	check_cuda(cudaFree(v_base));
 	check_cuda(cudaStreamDestroy(prepare_stream));

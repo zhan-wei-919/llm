@@ -61,7 +61,6 @@ struct Ctx {		// 两次 run 共用的 device/pinned 资源, 每次 run 重建 po
 	cudaStream_t t;
 	void *k_base, *v_base;
 	size_t kv_bytes;
-	int *d_meta, *h_meta;
 	float *dq, *dk, *dv, *dout;
 	int *d_rid, *h_rid, *d_pos, *h_pos, *d_rows, *h_rows;	// 每行/每条目元数据, 双份轮换
 	int *d_tok, *h_tok;
@@ -102,10 +101,11 @@ static void launch_step(Ctx &c, Engine &eng, const StepPlan &plan,
 
 // 同一个 driver, 两种用法; pipelined=false 即同步 oracle
 static std::vector<std::vector<int>> run(Ctx &c, bool pipelined) {
-	KV_Pool pool(c.k_base, c.v_base, Dtype::F32, KS, c.kv_bytes, 1, MAX_SEQS, MAX_SEQ_LEN);
-	Arena arena(/*max_tensors=*/2);
-	Engine eng(arena, pool, NH, NKV, HS, c.d_meta, c.h_meta);
+	Arena arena(/*max_tensors=*/3);
+	Engine eng(arena, NH, NKV, HS, MAX_SEQS, MAX_SEQ_LEN);
 	arena.finalize();
+	KV_Pool pool(c.k_base, c.v_base, Dtype::F32, KS, c.kv_bytes, 1, MAX_SEQS, MAX_SEQ_LEN);
+	eng.bind_pool(&pool);
 	Scheduler sched(pool, {MAX_SEQS, BUDGET, /*eos=*/-1});
 	for (int i = 0; i < NREQ; ++i)
 		sched.add_request(std::vector<int>(PROMPT_LEN[i], i), MAX_NEW[i]);
@@ -138,10 +138,6 @@ int main() {
 	c.kv_bytes = (size_t)BLOCKS * KV_BLOCK_SIZE * KS * sizeof(float);
 	cudaMalloc(&c.k_base, c.kv_bytes);
 	cudaMalloc(&c.v_base, c.kv_bytes);
-	int W = MAX_SEQ_LEN / KV_BLOCK_SIZE, L = W * KV_BLOCK_SIZE;
-	int meta_ints = MAX_SEQS * W + MAX_SEQS + MAX_SEQS + MAX_SEQS * L + (MAX_SEQS + 1);
-	cudaMalloc(&c.d_meta, meta_ints * sizeof(int));
-	cudaHostAlloc(&c.h_meta, (size_t)2 * meta_ints * sizeof(int), 0);	// Engine 双半区
 	cudaMalloc(&c.dq,   (size_t)BUDGET * QS * sizeof(float));
 	cudaMalloc(&c.dk,   (size_t)BUDGET * KS * sizeof(float));
 	cudaMalloc(&c.dv,   (size_t)BUDGET * KS * sizeof(float));
@@ -166,9 +162,9 @@ int main() {
 	}
 	printf("test_pipeline_gpu PASS: %d 请求, PipelineDriver 流水模式与同步 oracle 逐 token 一致\n", NREQ);
 
-	cudaFreeHost(c.h_meta); cudaFreeHost(c.h_rid); cudaFreeHost(c.h_pos);
+	cudaFreeHost(c.h_rid); cudaFreeHost(c.h_pos);
 	cudaFreeHost(c.h_rows); cudaFreeHost(c.h_tok);
-	cudaFree(c.k_base); cudaFree(c.v_base); cudaFree(c.d_meta);
+	cudaFree(c.k_base); cudaFree(c.v_base);
 	cudaFree(c.dq); cudaFree(c.dk); cudaFree(c.dv); cudaFree(c.dout);
 	cudaFree(c.d_rid); cudaFree(c.d_pos); cudaFree(c.d_rows); cudaFree(c.d_tok);
 	cudaStreamDestroy(c.t);

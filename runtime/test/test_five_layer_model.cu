@@ -68,21 +68,10 @@ int main() {
 	void *k_base, *v_base;
 	check_cuda(cudaMalloc(&k_base, kv_bytes));
 	check_cuda(cudaMalloc(&v_base, kv_bytes));
-	KV_Pool pool(k_base, v_base, Dtype::F32, NKV * HS, kv_bytes,
-	             NUM_LAYERS, MAX_SEQS, MAX_SEQ_LEN);
-
-	constexpr int W = (MAX_SEQ_LEN + KV_BLOCK_SIZE - 1) / KV_BLOCK_SIZE;
-	constexpr int L = W * KV_BLOCK_SIZE;
-	constexpr int META_INTS = MAX_SEQS * W + MAX_SEQS + MAX_SEQS
-	                        + MAX_SEQS * L + (MAX_SEQS + 1);
-	int *d_meta, *h_meta;
-	check_cuda(cudaMalloc(&d_meta, META_INTS * sizeof(int)));
-	check_cuda(cudaHostAlloc(&h_meta, 2 * META_INTS * sizeof(int), 0));
-
 	{
 		LLM llm(/*max_tensors=*/128);
 		cudaStream_t stream = llm.stream();
-		Engine engine(llm.arena(), pool, NH, NKV, HS, d_meta, h_meta);
+		Engine engine(llm.arena(), NH, NKV, HS, MAX_SEQS, MAX_SEQ_LEN);
 		Tensor *token_ids = llm.arena().alloc({MAX_TOKENS}, Dtype::I32);
 		Embedding<float> embedding(llm, token_ids, MAX_TOKENS, VOCAB, HIDDEN,
 		                           "model.embed_tokens");
@@ -102,6 +91,9 @@ int main() {
 		                          "lm_head");
 
 		llm.finalize();
+		KV_Pool pool(k_base, v_base, Dtype::F32, NKV * HS, kv_bytes,
+		             NUM_LAYERS, MAX_SEQS, MAX_SEQ_LEN);
+		engine.bind_pool(&pool);
 		engine.init_rope(stream);
 		check_cuda(cudaStreamSynchronize(stream));
 		randomize_parameters(llm);
@@ -190,8 +182,6 @@ int main() {
 		check_cuda(cudaFree(d_sample));
 	}
 
-	check_cuda(cudaFreeHost(h_meta));
-	check_cuda(cudaFree(d_meta));
 	check_cuda(cudaFree(k_base));
 	check_cuda(cudaFree(v_base));
 	std::printf("test_five_layer_model PASS: prefill + decode + mixed batch + multi-shape graph replay\n");

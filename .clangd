@@ -1,7 +1,7 @@
 # clangd 配置 —— CUDA 13.3 + clang/clangd 21 + RTX 5060 Ti (sm_120)
 #
 # 说明:
-# - 把 .cu/.cuh 当 CUDA 解析(-x cuda),这样 __global__ / <<<>>> / threadIdx 等不报错。
+# - 把 .cu/.h 当 CUDA 解析(-x cuda),这样 __global__ / <<<>>> / threadIdx 等不报错。
 # - CUDA 13 比 clang 21 的内置 CUDA 兼容层新,有两处头文件不兼容,这里绕过:
 #     1. -I .clangd-shims  提供被删掉的 texture_fetch_functions.h 空 stub。
 #     2. -D_NV_RSQRT_SPECIFIER  补上 wrapper 跳过 math_functions.h 时缺失的宏。

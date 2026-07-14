@@ -1,5 +1,5 @@
-#include "../TokenEmbedding.cuh"
-#include "../../utils.cuh"
+#include "../TokenEmbedding.h"
+#include "../../utils.h"
 #include <cassert>
 #include <cstdio>
 #include <vector>

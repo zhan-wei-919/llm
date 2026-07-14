@@ -1,7 +1,7 @@
 #include "../Engine.h"
 #include "../Scheduler.h"
 #include "../Driver.h"
-#include "../../tensor/Arena.cuh"
+#include "../../tensor/Arena.h"
 #include "../GraphShape.h"
 #include <cstdio>
 #include <vector>

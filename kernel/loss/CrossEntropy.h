@@ -3,7 +3,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cuda_bf16.h>
-#include "../reduce/Reduce.cuh"
+#include "../reduce/Reduce.h"
 
 template<typename T>
 __global__ void cross_entropy(

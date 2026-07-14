@@ -4,8 +4,8 @@
 #include <mma.h>
 #include <type_traits>
 #include "Config.h"
-#include "GemmLoader.cuh"
-#include "MmaPtx.cuh"
+#include "GemmLoader.h"
+#include "MmaPtx.h"
 
 template<typename Config>
 __global__ void Gemm (

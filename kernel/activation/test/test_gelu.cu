@@ -1,5 +1,5 @@
-#include "../GELU.cuh"
-#include "../../utils.cuh"
+#include "../GELU.h"
+#include "../../utils.h"
 #include <cstdio>
 #include <cmath>
 

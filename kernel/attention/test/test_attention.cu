@@ -1,5 +1,5 @@
-#include "../Attention.cuh"
-#include "../../utils.cuh"
+#include "../Attention.h"
+#include "../../utils.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>

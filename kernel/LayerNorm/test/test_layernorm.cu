@@ -1,5 +1,5 @@
-#include "../../utils.cuh"
-#include "../LayerNorm.cuh"
+#include "../../utils.h"
+#include "../LayerNorm.h"
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>

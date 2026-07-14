@@ -2,11 +2,11 @@
 #include <cuda_runtime.h>
 #include "../kv/KV_pool.h"
 #include "../tensor/Tensor.h"
-#include "../tensor/Arena.cuh"
-#include "../kernel/attention/Scatter_kv.cuh"
-#include "../kernel/attention/GQAttention_prefill.cuh"
-#include "../kernel/embedding/RoPECache.cuh"
-#include "../kernel/embedding/RoPE.cuh"
+#include "../tensor/Arena.h"
+#include "../kernel/attention/Scatter_kv.h"
+#include "../kernel/attention/GQAttention_prefill.h"
+#include "../kernel/embedding/RoPECache.h"
+#include "../kernel/embedding/RoPE.h"
 #include "GraphShape.h"
 
 // Engine: 把"一步推理"翻译成固定的操作序列
@@ -106,6 +106,7 @@ public:
 
 	Tensor *cos_table() {return cos_;}
 	Tensor *sin_table() {return sin_;}
+	const int *cu_seqlens() const {return d_cu_seqlens_;}
 	std::vector<int> qkv_size() {return {NH_, NKV_, HS_};}
 
 private:

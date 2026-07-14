@@ -1,5 +1,5 @@
-#include "../CrossEntropy.cuh"
-#include "../../utils.cuh"
+#include "../CrossEntropy.h"
+#include "../../utils.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>

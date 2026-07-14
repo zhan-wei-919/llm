@@ -1,6 +1,6 @@
 #pragma once
 #include <cassert>
-#include "../reduce/Reduce.cuh"
+#include "../reduce/Reduce.h"
 #include "../../kv/KV_Layout.h"
 
 //

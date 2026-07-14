@@ -1,5 +1,5 @@
-#include "../Transpose.cuh"
-#include "../../utils.cuh"
+#include "../Transpose.h"
+#include "../../utils.h"
 #include <cstdio>
 #include <cstdlib>
 

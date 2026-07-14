@@ -1,5 +1,5 @@
-#include "../Reduce.cuh"
-#include "../../utils.cuh"
+#include "../Reduce.h"
+#include "../../utils.h"
 #include <cub/cub.cuh>
 #include <cstdio>
 #include <cfloat>

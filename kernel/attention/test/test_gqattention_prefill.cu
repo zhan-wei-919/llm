@@ -1,5 +1,5 @@
-#include "../GQAttention_prefill.cuh"
-#include "../../utils.cuh"
+#include "../GQAttention_prefill.h"
+#include "../../utils.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>

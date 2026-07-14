@@ -3,8 +3,8 @@
 #include "../Module.h"
 #include "../../tensor/Tensor.h"
 #include <type_traits>
-#include "../../kernel/Gemm/Gemm.cuh"
-#include "../../kernel/Gemm/Gemm_f32.cuh"
+#include "../../kernel/Gemm/Gemm.h"
+#include "../../kernel/Gemm/Gemm_f32.h"
 
 template<typename T>
 class Linear : public Module {
@@ -14,7 +14,7 @@ public:
 		weight_ = llm.parameter(prefix + ".weight", {in_channel_, out_channel_}, dtype_of<T>::value);
 		out_ = llm.arena().alloc({max_tokens, out_channel_}, dtype_of<T>::value);
 		bias_ = has_bias_? llm.parameter(prefix + ".bias", {out_channel_}, dtype_of<T>::value) : nullptr;
-		attach(llm, *this);
+		attach(llm, *this, {input_}, {out_});
 	}
 
 	void forward(const GraphShape &shape, cudaStream_t stream) {

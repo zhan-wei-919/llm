@@ -2,7 +2,7 @@
 #include <string>
 #include "../Module.h"
 #include "../../tensor/Tensor.h"
-#include "../../kernel/embedding/TokenEmbedding.cuh"
+#include "../../kernel/embedding/TokenEmbedding.h"
 
 template<typename T>
 class Embedding : public Module {
@@ -12,7 +12,7 @@ public:
 	: token_ids_(token_ids), hidden_dim_(hidden_dim) {
 		weight_ = llm.parameter(prefix + ".weight", {vocab_size, hidden_dim}, dtype_of<T>::value);
 		out_ = llm.arena().alloc({max_tokens, hidden_dim}, dtype_of<T>::value);
-		attach(llm, *this);
+		attach(llm, *this, {token_ids_}, {out_});
 	}
 
 	void forward(const GraphShape &shape, cudaStream_t stream) {

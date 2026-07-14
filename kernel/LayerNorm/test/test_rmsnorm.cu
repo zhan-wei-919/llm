@@ -1,5 +1,5 @@
-#include "../RMSNorm.cuh"
-#include "../../utils.cuh"
+#include "../RMSNorm.h"
+#include "../../utils.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>

@@ -1,5 +1,5 @@
-#include "../Gemm.cuh"
-#include "../../utils.cuh"
+#include "../Gemm.h"
+#include "../../utils.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cublas_v2.h>

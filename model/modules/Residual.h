@@ -2,7 +2,7 @@
 #include <string>
 #include "../Module.h"
 #include "../../tensor/Tensor.h"
-#include "../../kernel/residual/Residual.cuh"
+#include "../../kernel/residual/Residual.h"
 
 template<typename T>
 class Residual : public Module {
@@ -10,7 +10,7 @@ public:
 	Residual(LLM &llm, Tensor *x1, Tensor *x2, int max_tokens, int hidden_dim)
 	:x1_(x1), x2_(x2), hidden_dim_(hidden_dim) {
 		out_ = llm.arena().alloc({max_tokens, hidden_dim_}, dtype_of<T>::value);
-		attach(llm, *this);
+		attach(llm, *this, {x1_, x2_}, {out_});
 	}
 
 	void forward(const GraphShape &shape, cudaStream_t stream) {

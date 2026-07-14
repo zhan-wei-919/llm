@@ -1,4 +1,4 @@
-#include "../LLM.cuh"
+#include "../LLM.h"
 #include <algorithm>
 #include <cassert>
 #include <cstdint>

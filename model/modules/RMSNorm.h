@@ -2,7 +2,7 @@
 #include <string>
 #include "../Module.h"
 #include "../../tensor/Tensor.h"
-#include "../../kernel/LayerNorm/RMSNorm.cuh"
+#include "../../kernel/LayerNorm/RMSNorm.h"
 
 template<typename T>
 class RMSNorm : public Module {
@@ -11,7 +11,7 @@ public:
 	: input_(input), hidden_dim_(hiddem_dim), eps_(eps) {
 		weight_ = llm.parameter(prefix + ".weight", {hidden_dim_}, dtype_of<T>::value);
 		out_ = llm.arena().alloc({max_tokens, hidden_dim_}, dtype_of<T>::value);
-		attach(llm, *this);
+		attach(llm, *this, {input_}, {out_});
 	}
 
 	void forward(const GraphShape &shape, cudaStream_t stream) {

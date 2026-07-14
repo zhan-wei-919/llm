@@ -1,5 +1,5 @@
-#include "../Residual.cuh"
-#include "../../utils.cuh"
+#include "../Residual.h"
+#include "../../utils.h"
 #include <cstdio>
 #include <cstdlib>
 

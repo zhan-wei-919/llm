@@ -1,5 +1,5 @@
-#include "../GQAttention_decode.cuh"
-#include "../../utils.cuh"
+#include "../GQAttention_decode.h"
+#include "../../utils.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>

@@ -2,7 +2,7 @@
 #include <string>
 #include "../Module.h"
 #include "../../tensor/Tensor.h"
-#include "../../kernel/activation/SwiGLU.cuh"
+#include "../../kernel/activation/SwiGLU.h"
 
 template<typename T>
 class SwiMul : public Module {
@@ -10,7 +10,7 @@ public:
 	SwiMul(LLM &llm, Tensor *gate, Tensor *up, int max_tokens, int proj_dim)
 	: gate_(gate), up_(up), proj_dim_(proj_dim) {
 		out_ = llm.arena().alloc({max_tokens, proj_dim_}, dtype_of<T>::value);
-		attach(llm, *this);
+		attach(llm, *this, {gate_, up_}, {out_});
 	}
 
 	void forward(const GraphShape &shape, cudaStream_t stream) {

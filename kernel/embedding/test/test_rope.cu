@@ -1,5 +1,5 @@
-#include "../RoPE.cuh"
-#include "../../utils.cuh"
+#include "../RoPE.h"
+#include "../../utils.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>

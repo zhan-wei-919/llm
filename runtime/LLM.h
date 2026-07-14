@@ -6,14 +6,18 @@
 #include <algorithm>
 #include <cstring>
 #include <fstream>
+#include <functional>
+#include <optional>
 #include <string>
 #include <utility>
-#include "../tensor/Arena.cuh"
+#include "../tensor/Arena.h"
 #include "../utils/safetensor_loader.h"
+#include "../kernel/sampling/Argmax.h"
 #include "Engine.h"
 #include "../kv/KV_pool.h"
 #include "../tensor/Tensor.h"
 #include "Scheduler.h"
+#include "Driver.h"
 #include "../tokenizer/llama_tokenizer.h"
 #include "OpRecord.h"
 
@@ -22,6 +26,20 @@ inline constexpr uint64_t SAFETENSOR_LOAD_BUFFER_BYTES = 1ull << 30;
 class LLM {
 	friend class Module;
 public:
+	// wait=false: 非阻塞取当前输入; wait=true: server idle 时阻塞等待。
+	// idle 等待返回 nullopt 时，server 退出。
+	using ReceiveFn = std::function<std::optional<std::string>(bool wait)>;
+	// 请求完成后立即回调，只返回新生成的文本。
+	using EmitFn = std::function<void(int request_id, std::string generated_text)>;
+
+	struct InferenceBuffers {
+		int *h_inputs;
+		int *d_tokens;
+		int *h_tokens;
+		int input_stride;
+		int token_stride;
+	};
+
 	explicit LLM(int max_tensors)
 	: arena_(max_tensors){
 		cudaStreamCreate(&stream_);
@@ -128,13 +146,73 @@ public:
 		}
 		cudaGraphLaunch(it->second, stream_);
 	}
+
+	void inference(const StepPlan &plan, int parity, Engine &engine, const InferenceBuffers &buffers) {
+		int batch = static_cast<int>(plan.req_ids.size());
+		int total_tokens = static_cast<int>(plan.ids.size());
+		int *h_input = buffers.h_inputs + parity * buffers.input_stride;
+		std::copy(plan.ids.begin(), plan.ids.end(), h_input);
+		cudaMemcpyAsync(program_.front().input()->ptr, h_input, total_tokens * sizeof(int), cudaMemcpyHostToDevice, stream_);
+		GraphShape shape = engine.prepare( plan.slots.data(), batch, plan.lens.data(), stream_);
+		forward(shape);
+		Tensor *logits = program_.back().output();
+		int *d_tokens = buffers.d_tokens + parity * buffers.token_stride;
+		int *h_tokens = buffers.h_tokens + parity * buffers.token_stride;
+		launch_argmax_last_token(d_tokens, logits->ptr, logits->dtype, engine.cu_seqlens(), batch, logits->shape[1], stream_);
+		cudaMemcpyAsync(h_tokens, d_tokens, batch * sizeof(int), cudaMemcpyDeviceToHost, stream_);
+	}
+
+	void server(const ReceiveFn &receive, const EmitFn &emit, int max_new_tokens, Engine &engine, KV_Pool &pool,
+	            SchedulerConfig config, const std::string &tokenizer_path) {
+		InferenceBuffers buffers;
+		buffers.input_stride = config.max_num_batched_tokens;
+		buffers.token_stride = config.max_num_seqs;
+		cudaHostAlloc(&buffers.h_inputs, 	2 * buffers.input_stride * sizeof(int), 0);
+		cudaMalloc(&buffers.d_tokens, 2 * buffers.token_stride * sizeof(int));
+		cudaHostAlloc(&buffers.h_tokens, 2 * buffers.token_stride * sizeof(int), 0);
+
+		Scheduler scheduler(pool, config);
+		auto submit = [&](const std::string &input) {
+			scheduler.add_request(tokenize(input, tokenizer_path), max_new_tokens);
+		};
+		auto on_finished = [&](std::vector<Request> &&done) {
+			for (Request &request : done) {
+				std::vector<int> generated(
+					request.token_ids.begin() + request.prompt_len,
+					request.token_ids.end());
+				emit(request.id, detokenize(generated, tokenizer_path));
+			}
+		};
+		auto launch = [&](const StepPlan &plan, int parity) {
+			inference(plan, parity, engine, buffers);
+		};
+
+		{
+			PipelineDriver driver(scheduler, buffers.h_tokens, buffers.token_stride, stream_, launch, on_finished);
+			while (true) {
+				std::optional<std::string> input = receive(true);
+				if (!input) break;
+				submit(*input);
+				while (true) {
+					while ((input = receive(false))) submit(*input);
+					if (driver.pump() == PipelineDriver::Pump::IDLE) break;
+				}
+			}
+		}
+
+		cudaFreeHost(buffers.h_inputs);
+		cudaFree(buffers.d_tokens);
+		cudaFreeHost(buffers.h_tokens);
+	}
+
 	void finalize() {arena_.finalize();}
 
 
 private:
 	template<typename T>
-	void append(T &module) {
-		program_.emplace_back(module);
+	void append(T &module, std::initializer_list<Tensor *> inputs,
+	            std::initializer_list<Tensor *> outputs) {
+		program_.emplace_back(module, inputs, outputs);
 	}
 
 	Arena arena_;

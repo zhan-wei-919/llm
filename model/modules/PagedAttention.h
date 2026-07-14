@@ -10,7 +10,7 @@ public:
 	PagedAttention(LLM &llm, Engine &engine, Tensor *q, Tensor *k, Tensor *v, int layer)
 	: engine_(engine), q_(q), k_(k), v_(v), layer_(layer) {
 		out_ = llm.arena().alloc({q_->shape[0], q_->shape[1]}, dtype_of<T>::value);
-		attach(llm, *this);
+		attach(llm, *this, {q_, k_, v_}, {out_});
 	}
 
 	void forward(const GraphShape &, cudaStream_t stream) {

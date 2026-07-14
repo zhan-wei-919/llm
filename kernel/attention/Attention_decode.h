@@ -1,6 +1,6 @@
 #pragma once
 #include <cassert>
-#include "../reduce/Reduce.cuh"
+#include "../reduce/Reduce.h"
 #include <cmath>
 #include <cstddef>
 #define MAX_SEQ_LEN 1024

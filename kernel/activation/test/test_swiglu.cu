@@ -1,5 +1,5 @@
-#include "../SwiGLU.cuh"
-#include "../../utils.cuh"
+#include "../SwiGLU.h"
+#include "../../utils.h"
 #include <cstdio>
 #include <cmath>
 

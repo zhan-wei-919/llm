@@ -1,5 +1,5 @@
-#include "../add_pos_embedding.cuh"
-#include "../../utils.cuh"
+#include "../add_pos_embedding.h"
+#include "../../utils.h"
 #include <cstdio>
 #include <cstdlib>
 

@@ -12,7 +12,7 @@ struct GraphShape {
 
 // 哈希值 = [ batch 的 32 位 ][ total_tokens 的 32 位 ]
 // 比如{8, 2048} = 0x00000008_00000800
-// 不管 lens 是 [1,1,62] 还是 [16,16,32]，都使用同一张图
+// 同一 phase 内，不管 lens 是 [1,1,62] 还是 [16,16,32]，都使用同一张图
 struct GraphShapeHash {
 	size_t operator() (const GraphShape &shape) const {
 		return

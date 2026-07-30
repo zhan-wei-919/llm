@@ -10,8 +10,7 @@
 
 // 手工性能基准: 测量 decode 闭环的"步间气泡". 不进默认测试.
 //
-// 时序骨架由 PipelineDriver 提供 (深度 1 投机流水: 发射 N+1 在前, 消费 N 在后,
-// chunk 与 decode 同走流水, 抢占只在排空态放行, 先 flush 后 update).
+// 时序骨架由 PipelineDriver 提供：P/D 每轮各尝试一批，两个 buffer slot 组成 FIFO。
 // 本文件只提供"怎么算一步"(launch 闭包) 与观测 (计时/气泡/守恒断言).
 // q/k/v 常驻 device (真实系统里激活来自上一层 GEMM, 不过 PCIe);
 // token 经双份 device buffer 异步 D2H 回 pinned host 内存, event 标记完成.
@@ -44,7 +43,7 @@ __global__ void fill_pattern(float *p, size_t n) {
 // 伪采样: 从 attention 输出算一个确定性 token.
 // 值本身无意义, 意义在于制造"下一步判停依赖本步 GPU 输出"的数据依赖.
 // rows[b] 是第 b 条序列在打包输出里的最后一行 (它的 logits 行, 即段尾);
-// chunk 与 decode 混装后行号不再恒等于 b, 统一由 host 按 lens 前缀和算好传入.
+// Prefill chunk 的段尾行号不恒等于 b, 统一由 host 按 lens 前缀和算好传入.
 __global__ void fake_sample(int *tokens, const float *out, int qs, const int *rows) {
 	int b = blockIdx.x;
 	int row = rows ? rows[b] : b;
@@ -68,7 +67,8 @@ int main() {
 	cudaMalloc(&v_base, kv_bytes);
 	KV_Pool pool(k_base, v_base, Dtype::F32, KS, kv_bytes, 1, B, MAX_SEQ_LEN);
 	eng.bind_pool(&pool);
-	Scheduler sched(pool, {/*max_num_seqs=*/B, /*max_num_batched_tokens=*/B * PROMPT_LEN, /*eos=*/-1});
+	LocalKvHandoff handoff;
+	Scheduler sched(pool, {/*max_num_seqs=*/B, /*max_num_batched_tokens=*/B * PROMPT_LEN, /*eos=*/-1}, handoff);
 
 	// 激活常驻 device, 内容填一次伪随机即可 (attention 耗时与数值无关)
 	size_t rows_cap = (size_t)B * PROMPT_LEN;	// prefill 打包行数是峰值
@@ -91,7 +91,7 @@ int main() {
 	for (int i = 0; i < B; ++i)
 		sched.add_request(std::vector<int>(PROMPT_LEN, i), MAX_NEW);
 
-	// ---------- 流水线主循环 (深度 1) ----------
+	// ---------- 双槽 FIFO 流水线主循环 ----------
 	std::vector<cudaEvent_t> ev_start(MAX_NEW + 8), ev_end(MAX_NEW + 8);
 	for (size_t i = 0; i < ev_start.size(); ++i) {
 		cudaEventCreate(&ev_start[i]);
@@ -103,17 +103,19 @@ int main() {
 	// "怎么算一步": 段尾行号 staging + 全部 GPU 命令异步入队 (契约: 不做任何同步).
 	// 段尾行号复用与 token 相同的双缓冲纪律 —— 同奇偶的上一次使用
 	// 已在两步前被 event 确认消费, 此刻 host/device 半区都是空闲的.
-	auto launch_fn = [&](const StepPlan &plan, int p) {
+	auto launch_fn = [&](const ScheduledBatch &batch, int p) {
+		const StepPlan &plan = batch.plan;
 		int nb = (int)plan.req_ids.size();
 		for (int b = 0, acc = 0; b < nb; ++b) { acc += plan.lens[b]; h_rows[p * B + b] = acc - 1; }
 		auto c1 = std::chrono::steady_clock::now();
-		cudaEventRecord(ev_start[step], t);
+		int launched_step = step++;
+		cudaEventRecord(ev_start[launched_step], t);
 		cudaMemcpyAsync(d_rows + p * B, h_rows + p * B, nb * sizeof(int), cudaMemcpyHostToDevice, t);
 		GraphShape shape = eng.prepare(plan.slots.data(), nb, plan.lens.data(), t);
 		eng.forward_layer(0, dq, dk, dv, dout, t);
 		fake_sample<<<nb, 1, 0, t>>>(d_tok + p * B, dout, QS, d_rows + p * B);
 		cudaMemcpyAsync(h_tok + p * B, d_tok + p * B, nb * sizeof(int), cudaMemcpyDeviceToHost, t);
-		cudaEventRecord(ev_end[step], t);
+		cudaEventRecord(ev_end[launched_step], t);
 		dt_engine = us_since(c1);
 		rows += nb;
 	};
@@ -131,7 +133,6 @@ int main() {
 			t_wait.push_back(t.wait_us);
 			t_update.push_back(t.update_us);
 		}
-		++step;
 	}
 	double wall_ms = us_since(wall0) / 1000.0;
 	cudaError_t err = cudaGetLastError();

@@ -2,7 +2,7 @@
 //
 // 同一组请求用同一个 driver 类跑两遍, 断言逐 token 相等:
 //   oracle 模式:  每次 pump 后立即 drain (退化为全同步屏障), 时序上不可能错;
-//   流水线模式:  run_to_idle (深度 1 投机: 发射 N+1 在前, 消费 N 在后, 无屏障).
+//   流水线模式:  run_to_idle (双槽 FIFO, 最多两批在途).
 // 两种模式只差主循环两行 —— 差分验证的就是 driver 的时序纪律.
 //
 // q/k/v 按 (请求, 位置) 内容寻址地现场生成, 与批内打包位置无关 —— 这是差分成立的前提:
@@ -11,7 +11,7 @@
 // attention 前缀读取、双缓冲轮换在流水线下全部正确.
 //
 // 配置故意制造边界: 预算 128 强制切 chunk (300→128/128/44), 129→128/1 (单 token final),
-// 256 追平恰踩块边界 (pending_boundary 路径), 33/47 单 chunk 短请求穿插出混合批.
+// 256 追平恰踩块边界，33/47 单 chunk 短请求与 Decode 交替发射.
 // 块给足, 不触发抢占 (抢占时机在两种模式下合法不同, 会让差分失义).
 //
 // 编译: nvcc -O2 -arch=native test_pipeline_gpu.cu -o /tmp/test_pipeline_gpu
@@ -106,14 +106,16 @@ static std::vector<std::vector<int>> run(Ctx &c, bool pipelined) {
 	arena.finalize();
 	KV_Pool pool(c.k_base, c.v_base, Dtype::F32, KS, c.kv_bytes, 1, MAX_SEQS, MAX_SEQ_LEN);
 	eng.bind_pool(&pool);
-	Scheduler sched(pool, {MAX_SEQS, BUDGET, /*eos=*/-1});
+	LocalKvHandoff handoff;
+	Scheduler sched(pool, {MAX_SEQS, BUDGET, /*eos=*/-1}, handoff);
 	for (int i = 0; i < NREQ; ++i)
 		sched.add_request(std::vector<int>(PROMPT_LEN[i], i), MAX_NEW[i]);
 
 	std::vector<std::vector<int>> gen(NREQ);
 	std::vector<int> prog(NREQ, 0);
 	// "怎么算一步": 捕获计算资源 (c/eng/prog), plan 与半区编号由 driver 传入
-	auto launch_fn = [&c, &eng, &prog](const StepPlan &plan, int p) {
+	auto launch_fn = [&c, &eng, &prog](const ScheduledBatch &batch, int p) {
+		const StepPlan &plan = batch.plan;
 		int total = stage_inputs(plan, prog, c.h_rid + p * BUDGET,
 		                         c.h_pos + p * BUDGET, c.h_rows + p * MAX_SEQS);
 		launch_step(c, eng, plan, total, p * BUDGET, p * MAX_SEQS);

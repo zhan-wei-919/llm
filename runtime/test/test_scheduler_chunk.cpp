@@ -1,220 +1,207 @@
-// chunked prefill + 混合批的纯逻辑单测: 不碰 GPU, KV_Pool 用空指针构造 (调度路径不解引用 k/v base).
-// 测试扮演 Engine: 按 driver 契约, 每个 plan 返回后、下一次 schedule 前调 pool.append 落账.
-//
-// 场景 A: 单条长 prompt (80) > 预算 (32) → 切成 32/32/16 三个 chunk;
-//         中间 chunk 不产 token、slot 跨步保持、partial 全程不离开 waiting 队头;
-//         追平后进入 decode 稳态直至完成.
-// 场景 B: 两条 prompt (40/40) 共享预算 (32) → FCFS 装箱:
-//         [r0:32] → [r0:8(final), r1:24] → 混合批 [r0:1(decode), r1:16(final)];
-//         验证"每步至多一个 partial 且必在队头", 以及 decode 不因追赶者停摆.
-// 场景 C: 投机连排 —— 三个 chunk 连续排定, 中间不夹任何 update (流水线的调度侧本质).
-//         排定即落账 (scheduled_len): 每次 schedule 都从排定进度接着切, 不重复、不隐身;
-//         final 排定即出队, 晋升等 update, 中间有一拍可接受的空 plan.
-//
-// 编译: g++ -std=c++17 -I/usr/local/cuda/include -o test_scheduler_chunk test_scheduler_chunk.cpp
 #include "../Scheduler.h"
+#include <cassert>
 #include <cstdio>
 
-// 扮演 Engine 的 launch 时记账: 每条目 append 本步要算的 token 数
-static void engine_append(KV_Pool &pool, const StepPlan &plan) {
-	for (size_t b = 0; b < plan.req_ids.size(); ++b)
-		pool.append(plan.slots[b], plan.lens[b]);
+static void engine_append(KV_Pool &pool, const ScheduledBatch &batch) {
+	for (size_t b = 0; b < batch.plan.req_ids.size(); ++b) pool.append(batch.plan.slots[b], batch.plan.lens[b]);
 }
 
 static KV_Pool make_pool(int num_blocks, int max_seqs, int max_seq_len) {
-	// kv_stride=1, F16(2字节) → 每块 32 字节, capacity 反推出想要的块数
 	return KV_Pool(nullptr, nullptr, Dtype::F16, 1, (size_t)num_blocks * KV_BLOCK_SIZE * 2, 1, max_seqs, max_seq_len);
+}
+
+static ScheduledBatch launch(Scheduler &sched, KV_Pool &pool, ExecutionPhase phase) {
+	ScheduledBatch batch = sched.schedule(phase);
+	if (!batch.empty()) engine_append(pool, batch);
+	return batch;
 }
 
 static void test_single_long_prompt() {
 	const int NB = 100;
-	KV_Pool pool = make_pool(NB, /*max_seqs=*/4, /*max_seq_len=*/256);
-	Scheduler sched(pool, {/*max_num_seqs=*/4, /*max_num_batched_tokens=*/32, /*eos=*/-1});
-	sched.add_request(std::vector<int>(80, 7), /*max_new_tokens=*/4);
+	KV_Pool pool = make_pool(NB, 4, 256);
+	LocalKvHandoff handoff;
+	Scheduler sched(pool, {4, 32, -1}, handoff);
+	sched.add_request(std::vector<int>(80, 7), 4);
 
-	// chunk 1: 预算截断出 32
-	StepPlan p1 = sched.schedule();
-	assert(p1.req_ids.size() == 1 && p1.lens[0] == 32);
-	int slot = p1.slots[0];
-	engine_append(pool, p1);
-	assert((int)pool.num_free_blocks() == NB - 2);		// 32 token = 2 块
-	assert(sched.num_waiting() == 1);			// partial 不出队, 一直占着队头
-	assert(sched.update(p1, {999}).empty());		// 中间 chunk: 假 token 必须被丢弃
-	assert(sched.num_waiting() == 1 && sched.num_running() == 0);
+	ScheduledBatch p1 = launch(sched, pool, ExecutionPhase::PREFILL);
+	assert(p1.phase == ExecutionPhase::PREFILL && p1.plan.lens == std::vector<int>{32});
+	int slot = p1.plan.slots[0];
+	assert(sched.update(p1, {999}).empty());
 
-	// chunk 2: 还是 32, slot 不变
-	StepPlan p2 = sched.schedule();
-	assert(p2.lens[0] == 32 && p2.slots[0] == slot);
-	engine_append(pool, p2);
+	ScheduledBatch p2 = launch(sched, pool, ExecutionPhase::PREFILL);
+	assert(p2.plan.lens == std::vector<int>{32} && p2.plan.slots[0] == slot);
 	assert(sched.update(p2, {999}).empty());
 
-	// chunk 3 (final): 剩余 16, 排定即出队; 追平产出第一个 token, 晋升 running
-	StepPlan p3 = sched.schedule();
-	assert(p3.lens[0] == 16 && p3.slots[0] == slot);
-	assert(sched.num_waiting() == 0);			// final 排定即出队, 晋升等 update
-	engine_append(pool, p3);
-	assert(sched.update(p3, {100}).empty());		// 产 token 但没到停止条件
-	assert(sched.num_waiting() == 0 && sched.num_running() == 1);
+	ScheduledBatch p3 = launch(sched, pool, ExecutionPhase::PREFILL);
+	assert(p3.plan.lens == std::vector<int>{16} && p3.plan.slots[0] == slot);
+	assert(sched.update(p3, {100}).empty());
 
-	// decode 稳态 3 步后按 max_new_tokens=4 收尾 (追平那步产 1 + decode 产 3)
 	std::vector<Request> done;
 	for (int i = 0; i < 3; ++i) {
-		StepPlan d = sched.schedule();
-		assert(d.req_ids.size() == 1);
-		assert(d.lens[0] == 1 && d.slots[0] == slot);	// decode 就是 len=1 的条目
-		engine_append(pool, d);
+		ScheduledBatch d = launch(sched, pool, ExecutionPhase::DECODE);
+		assert(d.phase == ExecutionPhase::DECODE && d.plan.lens == std::vector<int>{1});
 		auto out = sched.update(d, {101 + i});
 		done.insert(done.end(), out.begin(), out.end());
 	}
 	assert(done.size() == 1);
-	assert((int)done[0].token_ids.size() == 80 + 4);	// prompt + 4 个生成 token
-	assert(done[0].token_ids[80] == 100 && done[0].token_ids[83] == 103);
-
+	assert(done[0].token_ids.size() == 84 && done[0].token_ids[80] == 100 && done[0].token_ids[83] == 103);
 	sched.flush_release();
-	assert((int)pool.num_free_blocks() == NB);		// 块全额归还
-	assert((int)pool.num_free_slots() == 4);
-	assert(sched.num_preemptions() == 0);
-	printf("test_single_long_prompt PASS\n");
+	assert((int)pool.num_free_blocks() == NB && (int)pool.num_free_slots() == 4);
 }
 
-static void test_two_prompts_share_budget() {
+static void test_phase_batches_are_separate() {
 	const int NB = 100;
-	KV_Pool pool = make_pool(NB, /*max_seqs=*/4, /*max_seq_len=*/256);
-	Scheduler sched(pool, {/*max_num_seqs=*/4, /*max_num_batched_tokens=*/32, /*eos=*/-1});
-	int r0 = sched.add_request(std::vector<int>(40, 7), /*max_new_tokens=*/2);
-	int r1 = sched.add_request(std::vector<int>(40, 8), /*max_new_tokens=*/2);
+	KV_Pool pool = make_pool(NB, 4, 256);
+	LocalKvHandoff handoff;
+	Scheduler sched(pool, {4, 32, -1}, handoff);
+	int r0 = sched.add_request({7}, 3);
+	ScheduledBatch first = launch(sched, pool, ExecutionPhase::PREFILL);
+	sched.update(first, {100});
+	int r1 = sched.add_request({8}, 2);
 
-	// 步 1: r0 独占预算, 成为唯一 partial
-	StepPlan p1 = sched.schedule();
-	assert(p1.req_ids == std::vector<int>{r0} && p1.lens[0] == 32);
-	engine_append(pool, p1);
-	sched.update(p1, {999});
+	ScheduledBatch p = launch(sched, pool, ExecutionPhase::PREFILL);
+	ScheduledBatch d = launch(sched, pool, ExecutionPhase::DECODE);
+	assert(p.phase == ExecutionPhase::PREFILL && p.plan.req_ids == std::vector<int>{r1});
+	assert(d.phase == ExecutionPhase::DECODE && d.plan.req_ids == std::vector<int>{r0});
+	assert(p.plan.lens == std::vector<int>{1} && d.plan.lens == std::vector<int>{1});
+	sched.update(p, {200});
+	sched.update(d, {101});
 
-	// 步 2: 队头 partial 先拿 (r0 final 8), 剩余预算给后来者 (r1 拿 24 成为新 partial)
-	StepPlan p2 = sched.schedule();
-	assert((p2.req_ids == std::vector<int>{r0, r1}));
-	assert((p2.lens == std::vector<int>{8, 24}));
-	engine_append(pool, p2);
-	assert(sched.update(p2, {100, 999}).empty());		// r0 的 token 被消费, r1 的被丢弃
-	assert(sched.num_running() == 1 && sched.num_waiting() == 1);
-
-	// 步 3: 混合批 —— r0 的 decode 和 r1 的 final chunk 同一步, decode 优先在前.
-	// 这正是混合批的意义: r0 不再因为 r1 在追赶而停摆.
-	StepPlan p3 = sched.schedule();
-	assert((p3.req_ids == std::vector<int>{r0, r1}));
-	assert((p3.lens == std::vector<int>{1, 16}));
-	engine_append(pool, p3);
-	auto done3 = sched.update(p3, {101, 200});
-	assert(done3.size() == 1 && done3[0].id == r0);		// r0 第 2 个 token 到手, 提前一步完成
-	assert(sched.num_running() == 1 && sched.num_waiting() == 0);	// r1 刚追平晋升
-
-	// 步 4: 只剩 r1 的 decode
-	StepPlan p4 = sched.schedule();
-	assert((p4.req_ids == std::vector<int>{r1} && p4.lens[0] == 1));
-	engine_append(pool, p4);
-	auto done4 = sched.update(p4, {201});
-	assert(done4.size() == 1 && done4[0].id == r1);
-	assert((int)done4[0].token_ids.size() == 40 + 2);
-
+	ScheduledBatch d2 = launch(sched, pool, ExecutionPhase::DECODE);
+	assert((d2.plan.req_ids == std::vector<int>{r0, r1}));
+	auto done = sched.update(d2, {102, 201});
+	assert(done.size() == 2);
 	sched.flush_release();
-	assert((int)pool.num_free_blocks() == NB);
-	assert((int)pool.num_free_slots() == 4);
-	assert(sched.num_preemptions() == 0);
-	printf("test_two_prompts_share_budget PASS\n");
+	assert((int)pool.num_free_blocks() == NB && (int)pool.num_free_slots() == 4);
 }
 
-// 投机流水的调度侧本质: 连排三个 chunk, 中间不夹 update.
-// 旧屏障语义下 p2 会是空 plan (请求排定后出队隐身, 进度只在 update 推进);
-// 排定即落账后, 每次 schedule 都从 scheduled_len 接着切下一段.
 static void test_chunks_schedule_ahead() {
 	const int NB = 100;
-	KV_Pool pool = make_pool(NB, /*max_seqs=*/4, /*max_seq_len=*/256);
-	Scheduler sched(pool, {/*max_num_seqs=*/4, /*max_num_batched_tokens=*/32, /*eos=*/-1});
-	sched.add_request(std::vector<int>(80, 7), /*max_new_tokens=*/4);
+	KV_Pool pool = make_pool(NB, 4, 256);
+	LocalKvHandoff handoff;
+	Scheduler sched(pool, {4, 32, -1}, handoff);
+	sched.add_request(std::vector<int>(80, 7), 2);
 
-	StepPlan p1 = sched.schedule();
-	assert(p1.req_ids.size() == 1 && p1.lens[0] == 32);	// [0,32)
-	int slot = p1.slots[0];
-	engine_append(pool, p1);		// 契约: 已返回的 plan 先 launch, 再调下一次 schedule
-	StepPlan p2 = sched.schedule();		// ← update(p1) 还没发生
-	assert(p2.req_ids.size() == 1 && p2.lens[0] == 32 && p2.slots[0] == slot);	// [32,64)
-	engine_append(pool, p2);
-	StepPlan p3 = sched.schedule();
-	assert(p3.req_ids.size() == 1 && p3.lens[0] == 16 && p3.slots[0] == slot);	// [64,80) final
-	engine_append(pool, p3);
-	assert(sched.num_waiting() == 0 && sched.num_running() == 0);	// 排完出队, 晋升等 update
-	assert(sched.schedule().empty());	// 全部在途: 接受的一拍空隙
+	ScheduledBatch p1 = launch(sched, pool, ExecutionPhase::PREFILL);
+	ScheduledBatch p2 = launch(sched, pool, ExecutionPhase::PREFILL);
+	ScheduledBatch p3 = launch(sched, pool, ExecutionPhase::PREFILL);
+	assert(p1.plan.starts == std::vector<int>{0} && p2.plan.starts == std::vector<int>{32} && p3.plan.starts == std::vector<int>{64});
+	assert(sched.schedule(ExecutionPhase::PREFILL).empty());
+	sched.update(p1, {999});
+	sched.update(p2, {999});
+	sched.update(p3, {100});
+	ScheduledBatch d = launch(sched, pool, ExecutionPhase::DECODE);
+	auto done = sched.update(d, {101});
+	assert(done.size() == 1);
+	sched.flush_release();
+	assert((int)pool.num_free_blocks() == NB);
+}
 
-	// 结算按发射顺序补齐, 三本在途账 (scheduled-cached, in_flight, pending_*) 收敛归零
-	assert(sched.update(p1, {999}).empty());	// 中间 chunk: 假 token 丢弃
-	assert(sched.update(p2, {999}).empty());
-	assert(sched.update(p3, {100}).empty());	// 追平: 首 token 入账, 晋升
-	assert(sched.num_running() == 1);
+static void test_decode_waits_for_previous_token() {
+	KV_Pool pool = make_pool(100, 4, 256);
+	LocalKvHandoff handoff;
+	Scheduler sched(pool, {4, 32, -1}, handoff);
+	sched.add_request({7}, 3);
+	ScheduledBatch p = launch(sched, pool, ExecutionPhase::PREFILL);
+	sched.update(p, {100});
+	ScheduledBatch d1 = launch(sched, pool, ExecutionPhase::DECODE);
+	assert(d1.plan.ids == std::vector<int>{100});
+	assert(sched.schedule(ExecutionPhase::DECODE).empty());
+	sched.update(d1, {101});
+	ScheduledBatch d2 = launch(sched, pool, ExecutionPhase::DECODE);
+	assert(d2.plan.ids == std::vector<int>{101});
+	auto done = sched.update(d2, {102});
+	assert(done.size() == 1 && done[0].token_ids == std::vector<int>({7, 100, 101, 102}));
+	sched.flush_release();
+}
 
-	// decode 收尾 (max_new=4: 追平产 1 + decode 产 3), 资源守恒
+class DelayedHandoff final : public KvHandoff {
+public:
+	void begin(int request_id, KvLease source) override {pending_ = {request_id, source};}
+	std::vector<HandoffResult> poll() override {
+		if (!ready_) return {};
+		ready_ = false;
+		return {pending_};
+	}
+	void release() {ready_ = true;}
+
+private:
+	HandoffResult pending_{};
+	bool ready_ = false;
+};
+
+static void test_decode_waits_for_handoff() {
+	KV_Pool pool = make_pool(100, 4, 256);
+	DelayedHandoff handoff;
+	Scheduler sched(pool, {4, 32, -1}, handoff);
+	sched.add_request({7}, 2);
+	ScheduledBatch p = launch(sched, pool, ExecutionPhase::PREFILL);
+	sched.update(p, {100});
+	assert(sched.schedule(ExecutionPhase::DECODE).empty());
+	handoff.release();
+	ScheduledBatch d = launch(sched, pool, ExecutionPhase::DECODE);
+	assert(d.plan.ids == std::vector<int>{100});
+	auto done = sched.update(d, {101});
+	assert(done.size() == 1);
+	sched.flush_release();
+}
+
+static void test_prefill_reserve_uses_scheduled_length() {
+	KV_Pool pool = make_pool(2, 2, 16);
+	LocalKvHandoff handoff;
+	Scheduler sched(pool, {2, 16, -1}, handoff);
+	sched.add_request(std::vector<int>(5, 7), 2);
+	sched.add_request(std::vector<int>(5, 8), 2);
+	ScheduledBatch p = launch(sched, pool, ExecutionPhase::PREFILL);
+	assert(p.plan.req_ids.size() == 2 && p.plan.lens == std::vector<int>({5, 5}));
+	sched.update(p, {100, 200});
+	ScheduledBatch d = launch(sched, pool, ExecutionPhase::DECODE);
+	assert(d.plan.req_ids.size() == 2);
+	auto done = sched.update(d, {101, 201});
+	assert(done.size() == 2);
+	sched.flush_release();
+	assert(pool.num_free_blocks() == 2 && pool.num_free_slots() == 2);
+}
+
+static void test_decode_preemption_returns_to_prefill() {
+	KV_Pool pool = make_pool(3, 2, 32);
+	LocalKvHandoff handoff;
+	Scheduler sched(pool, {2, 16, -1}, handoff);
+	sched.add_request({7}, 20);
+	ScheduledBatch p = launch(sched, pool, ExecutionPhase::PREFILL);
+	sched.update(p, {100});
+	for (int i = 0; i < 15; ++i) {
+		ScheduledBatch d = launch(sched, pool, ExecutionPhase::DECODE);
+		sched.update(d, {101 + i});
+	}
+	int external = pool.alloc_seq();
+	pool.append(external, 32);
+	assert(sched.schedule(ExecutionPhase::DECODE).empty());
+	assert(sched.num_preemptions() == 1 && sched.num_prefill() == 1);
+	pool.release(external);
+	ScheduledBatch recompute0 = launch(sched, pool, ExecutionPhase::PREFILL);
+	ScheduledBatch recompute1 = launch(sched, pool, ExecutionPhase::PREFILL);
+	sched.update(recompute0, {999});
+	sched.update(recompute1, {200});
 	std::vector<Request> done;
 	for (int i = 0; i < 3; ++i) {
-		StepPlan d = sched.schedule();
-		assert(d.lens[0] == 1 && d.slots[0] == slot);
-		engine_append(pool, d);
-		auto out = sched.update(d, {101 + i});
+		ScheduledBatch d = launch(sched, pool, ExecutionPhase::DECODE);
+		auto out = sched.update(d, {201 + i});
 		done.insert(done.end(), out.begin(), out.end());
 	}
 	assert(done.size() == 1);
-	assert((int)done[0].token_ids.size() == 80 + 4);
-	assert(done[0].token_ids[80] == 100 && done[0].token_ids[83] == 103);
-
 	sched.flush_release();
-	assert((int)pool.num_free_blocks() == NB);
-	assert((int)pool.num_free_slots() == 4);
-	assert(sched.num_preemptions() == 0);
-	printf("test_chunks_schedule_ahead PASS\n");
-}
-
-// 精准自回归约束: 同一请求的上一个 decode 结果尚未 update 时，
-// token_ids.back() 仍是旧 token，不能再次为它排定 decode。
-static void test_decode_waits_for_previous_token() {
-	const int NB = 100;
-	KV_Pool pool = make_pool(NB, /*max_seqs=*/4, /*max_seq_len=*/256);
-	Scheduler sched(pool, {/*max_num_seqs=*/4, /*max_num_batched_tokens=*/32, /*eos=*/-1});
-	sched.add_request(/*prompt=*/{7}, /*max_new_tokens=*/3);
-
-	// prefill: 输入 prompt token 7，产生第一个生成 token 100。
-	StepPlan prefill = sched.schedule();
-	assert(prefill.ids == std::vector<int>{7});
-	engine_append(pool, prefill);
-	assert(sched.update(prefill, {100}).empty());
-
-	// 第一次 decode: 输入刚生成的 token 100；结果尚未 update。
-	StepPlan d1 = sched.schedule();
-	assert(d1.ids == std::vector<int>{100});
-	engine_append(pool, d1);
-
-	// d1 仍在途，CPU 只知道旧 token 100，因此同一请求必须暂时不可调度。
-	StepPlan blocked = sched.schedule();
-	assert(blocked.empty());
-
-	// d1 完成并提交 token 101 后，下一次 decode 才能以 101 为输入。
-	assert(sched.update(d1, {101}).empty());
-	StepPlan d2 = sched.schedule();
-	assert(d2.ids == std::vector<int>{101});
-	engine_append(pool, d2);
-
-	auto done = sched.update(d2, {102});
-	assert(done.size() == 1);
-	assert((done[0].token_ids == std::vector<int>{7, 100, 101, 102}));
-
-	sched.flush_release();
-	assert((int)pool.num_free_blocks() == NB);
-	assert((int)pool.num_free_slots() == 4);
-	printf("test_decode_waits_for_previous_token PASS\n");
+	assert(pool.num_free_blocks() == 3 && pool.num_free_slots() == 2);
 }
 
 int main() {
 	test_single_long_prompt();
-	test_two_prompts_share_budget();
+	test_phase_batches_are_separate();
 	test_chunks_schedule_ahead();
 	test_decode_waits_for_previous_token();
-	printf("all tests PASS\n");
+	test_decode_waits_for_handoff();
+	test_prefill_reserve_uses_scheduled_length();
+	test_decode_preemption_returns_to_prefill();
+	std::printf("test_scheduler_chunk PASS\n");
 	return 0;
 }

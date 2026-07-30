@@ -65,8 +65,8 @@ public:
 		return {current_B_, current_total_};
 	}
 
-	// forward: 混合批的统一一步. 本批 B 条序列首尾相接打包, lens[b] 是第 b 条本步
-	// 要算的 token 数 —— decode 条目为 1, 追赶 chunk 为一段, 同一次发射混装.
+	// forward: phase 无关的统一算子路径. 本批 B 条同 phase 序列首尾相接打包,
+	// Decode 的 lens 全为 1，Prefill 的 lens 是各自 chunk 长度.
 	// q: [total, NH*HS], k/v: [total, NKV*HS] 稠密激活, out: [total, NH*HS]
 	// scatter 先把本步 k/v 写进 pool, attention 经页表读 [0, pos+i] 的全部前缀
 	void forward_layer(int layer, const void *q, const void *k, const void *v, void *out, cudaStream_t stream){

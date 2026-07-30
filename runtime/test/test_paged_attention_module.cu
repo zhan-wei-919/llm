@@ -63,7 +63,7 @@ int main() {
 	int slots[] = {slot}, lens[] = {TOKENS};
 	GraphShape shape = engine.prepare(slots, 1, lens, prepare_stream);
 	check_cuda(cudaStreamSynchronize(prepare_stream));
-	llm.forward(shape);                         // 首次见到 shape，bake + launch
+	llm.forward(ExecutionPhase::PREFILL, shape); // 首次见到 shape，bake + launch
 	check_cuda(cudaDeviceSynchronize());
 	check_cuda(cudaMemcpy(h_out.data(), attention.out()->ptr,
 	                      h_out.size() * sizeof(float), cudaMemcpyDeviceToHost));
@@ -75,12 +75,26 @@ int main() {
 	GraphShape replay_shape = engine.prepare(slots, 1, lens, prepare_stream);
 	assert(replay_shape == shape);
 	check_cuda(cudaStreamSynchronize(prepare_stream));
-	llm.forward(replay_shape);                  // 同 shape，直接 replay
+	llm.forward(ExecutionPhase::PREFILL, replay_shape); // 同 shape，直接 replay
 	check_cuda(cudaDeviceSynchronize());
 	check_cuda(cudaMemcpy(h_out.data(), attention.out()->ptr,
 	                      h_out.size() * sizeof(float), cudaMemcpyDeviceToHost));
 	check_output(h_out, {3.25f, 4.0f, 4.5f});
 	assert(pool.seq_len(slot) == 2 * TOKENS);
+	assert(llm.num_graphs(ExecutionPhase::PREFILL) == 1);
+	int one[] = {1};
+	GraphShape unit_prefill = engine.prepare(slots, 1, one, prepare_stream);
+	check_cuda(cudaStreamSynchronize(prepare_stream));
+	llm.forward(ExecutionPhase::PREFILL, unit_prefill);
+	check_cuda(cudaDeviceSynchronize());
+	GraphShape unit_decode = engine.prepare(slots, 1, one, prepare_stream);
+	GraphShape unit_shape{1, 1};
+	assert(unit_prefill == unit_shape && unit_decode == unit_shape);
+	check_cuda(cudaStreamSynchronize(prepare_stream));
+	llm.forward(ExecutionPhase::DECODE, unit_decode);
+	check_cuda(cudaDeviceSynchronize());
+	assert(llm.num_graphs(ExecutionPhase::PREFILL) == 2);
+	assert(llm.num_graphs(ExecutionPhase::DECODE) == 1);
 
 	check_cuda(cudaFree(k_base));
 	check_cuda(cudaFree(v_base));

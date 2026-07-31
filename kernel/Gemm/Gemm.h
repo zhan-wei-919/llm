@@ -246,6 +246,39 @@ __global__ void GemmMma (
 #endif
 }
 
+static __global__ void GemmM1N2048K2048(
+		const __nv_bfloat16 *__restrict__ A,
+		const __nv_bfloat16 *__restrict__ B,
+		__nv_bfloat16 *__restrict__ C
+) {
+	int n = (blockIdx.x * 16 + threadIdx.x) * 2;
+	int part = threadIdx.y;
+	float acc0 = 0.0f, acc1 = 0.0f;
+	#pragma unroll 8
+	for (int k = part; k < 2048; k += 32) {
+		float a = __bfloat162float(A[k]);
+		float2 b = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&B[k * 2048 + n]));
+		acc0 = fmaf(a, b.x, acc0);
+		acc1 = fmaf(a, b.y, acc1);
+	}
+	acc0 += __shfl_down_sync(0xffffffff, acc0, 16);
+	acc1 += __shfl_down_sync(0xffffffff, acc1, 16);
+	__shared__ float partial[16][2][17];
+	if ((part & 1) == 0) {
+		partial[part / 2][0][threadIdx.x] = acc0;
+		partial[part / 2][1][threadIdx.x] = acc1;
+	}
+	__syncthreads();
+	if (part == 0) {
+		#pragma unroll
+		for (int i = 1; i < 16; ++i) {
+			acc0 += partial[i][0][threadIdx.x];
+			acc1 += partial[i][1][threadIdx.x];
+		}
+		*reinterpret_cast<__nv_bfloat162*>(&C[n]) = __floats2bfloat162_rn(acc0, acc1);
+	}
+}
+
 template<typename Config>
 void launch_Gemm_forward(
 		const typename Config::In *A,
@@ -254,6 +287,13 @@ void launch_Gemm_forward(
 		const typename Config::Out *bias,
 		float alpha, float beta, int M, int N, int K, cudaStream_t s
 ) {
+	if constexpr (std::is_same<typename Config::In, __nv_bfloat16>::value && std::is_same<typename Config::Out, __nv_bfloat16>::value) {
+		if (M == 1 && N == 2048 && K == 2048 && bias == nullptr && alpha == 1.0f && beta == 0.0f) {
+			dim3 block(16, 32);
+			GemmM1N2048K2048<<<64, block, 0, s>>>(A, B, C);
+			return;
+		}
+	}
 		dim3 block(Config::THREADS);
 		dim3 grid((N + Config::BN - 1) / Config::BN, (M + Config::BM - 1) / Config::BM);
 		if constexpr (sizeof(typename Config::In) == 2) {

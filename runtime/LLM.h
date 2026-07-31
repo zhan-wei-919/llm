@@ -1,5 +1,6 @@
 #pragma once
 #include <cuda_runtime.h>
+#include <array>
 #include <vector>
 #include <unordered_map>
 #include <initializer_list>
@@ -47,11 +48,12 @@ public:
 
 	~LLM(){
 		cudaStreamSynchronize(stream_);
-		for (auto &[shape, exec] : graphs_) cudaGraphExecDestroy(exec);
+		for (auto &cache : graphs_)
+			for (auto &[shape, exec] : cache) cudaGraphExecDestroy(exec);
 		cudaStreamDestroy(stream_);
 	}
 
-	cudaGraphExec_t bake(const GraphShape &shape) {
+	cudaGraphExec_t bake(ExecutionPhase, const GraphShape &shape) {
 		cudaGraph_t graph;
 		cudaStreamBeginCapture(stream_, cudaStreamCaptureModeGlobal);
 		for (const auto &op : program_) op.forward(shape, stream_);
@@ -137,29 +139,33 @@ public:
 		}
 	}
 
-	void forward(const GraphShape &shape) {
-		auto it = graphs_.find(shape);
-		if (it == graphs_.end()) {
+	void forward(ExecutionPhase phase, const GraphShape &shape) {
+		auto &cache = graphs_[phase == ExecutionPhase::PREFILL ? 0 : 1];
+		auto it = cache.find(shape);
+		if (it == cache.end()) {
 			cudaStreamSynchronize(stream_);
-			auto exec = bake(shape);
-			it = graphs_.emplace(shape, exec).first;
+			auto exec = bake(phase, shape);
+			it = cache.emplace(shape, exec).first;
 		}
 		cudaGraphLaunch(it->second, stream_);
 	}
 
-	void inference(const StepPlan &plan, int parity, Engine &engine, const InferenceBuffers &buffers) {
-		int batch = static_cast<int>(plan.req_ids.size());
+	size_t num_graphs(ExecutionPhase phase) const {return graphs_[phase == ExecutionPhase::PREFILL ? 0 : 1].size();}
+
+	void inference(const ScheduledBatch &batch, int parity, Engine &engine, const InferenceBuffers &buffers) {
+		const StepPlan &plan = batch.plan;
+		int batch_size = static_cast<int>(plan.req_ids.size());
 		int total_tokens = static_cast<int>(plan.ids.size());
 		int *h_input = buffers.h_inputs + parity * buffers.input_stride;
 		std::copy(plan.ids.begin(), plan.ids.end(), h_input);
 		cudaMemcpyAsync(program_.front().input()->ptr, h_input, total_tokens * sizeof(int), cudaMemcpyHostToDevice, stream_);
-		GraphShape shape = engine.prepare( plan.slots.data(), batch, plan.lens.data(), stream_);
-		forward(shape);
+		GraphShape shape = engine.prepare(plan.slots.data(), batch_size, plan.lens.data(), stream_);
+		forward(batch.phase, shape);
 		Tensor *logits = program_.back().output();
 		int *d_tokens = buffers.d_tokens + parity * buffers.token_stride;
 		int *h_tokens = buffers.h_tokens + parity * buffers.token_stride;
-		launch_argmax_last_token(d_tokens, logits->ptr, logits->dtype, engine.cu_seqlens(), batch, logits->shape[1], stream_);
-		cudaMemcpyAsync(h_tokens, d_tokens, batch * sizeof(int), cudaMemcpyDeviceToHost, stream_);
+		launch_argmax_last_token(d_tokens, logits->ptr, logits->dtype, engine.cu_seqlens(), batch_size, logits->shape[1], stream_);
+		cudaMemcpyAsync(h_tokens, d_tokens, batch_size * sizeof(int), cudaMemcpyDeviceToHost, stream_);
 	}
 
 	void server(const ReceiveFn &receive, const EmitFn &emit, int max_new_tokens, Engine &engine, KV_Pool &pool,
@@ -171,7 +177,8 @@ public:
 		cudaMalloc(&buffers.d_tokens, 2 * buffers.token_stride * sizeof(int));
 		cudaHostAlloc(&buffers.h_tokens, 2 * buffers.token_stride * sizeof(int), 0);
 
-		Scheduler scheduler(pool, config);
+		LocalKvHandoff handoff;
+		Scheduler scheduler(pool, config, handoff);
 		auto submit = [&](const std::string &input) {
 			scheduler.add_request(tokenize(input, tokenizer_path), max_new_tokens);
 		};
@@ -183,8 +190,8 @@ public:
 				emit(request.id, detokenize(generated, tokenizer_path));
 			}
 		};
-		auto launch = [&](const StepPlan &plan, int parity) {
-			inference(plan, parity, engine, buffers);
+		auto launch = [&](const ScheduledBatch &batch, int parity) {
+			inference(batch, parity, engine, buffers);
 		};
 
 		{
@@ -219,6 +226,6 @@ private:
 	std::vector<OpRecord> program_;
 	std::unordered_map<std::string, Tensor *> parameters_;
 	cudaStream_t stream_;
-	std::unordered_map<GraphShape, cudaGraphExec_t, GraphShapeHash> graphs_;
+	std::array<std::unordered_map<GraphShape, cudaGraphExec_t, GraphShapeHash>, 2> graphs_;
 
 };

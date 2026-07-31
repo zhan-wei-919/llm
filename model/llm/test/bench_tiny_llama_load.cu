@@ -109,7 +109,8 @@ struct RunStats {
 };
 
 RunStats run_load(LLM &llm, Engine &engine, KV_Pool &pool, int requests, int prompt_tokens, int new_tokens, bool measure) {
-	Scheduler scheduler(pool, {MAX_SEQS, MAX_BATCHED_TOKENS, /*eos=*/-1});
+	LocalKvHandoff handoff;
+	Scheduler scheduler(pool, {MAX_SEQS, MAX_BATCHED_TOKENS, /*eos=*/-1}, handoff);
 	LLM::InferenceBuffers buffers;
 	buffers.input_stride = MAX_BATCHED_TOKENS;
 	buffers.token_stride = MAX_SEQS;
@@ -122,9 +123,10 @@ RunStats run_load(LLM &llm, Engine &engine, KV_Pool &pool, int requests, int pro
 	std::vector<cudaEvent_t> starts(event_capacity), ends(event_capacity);
 	for (int i = 0; i < event_capacity; ++i) {cudaEventCreate(&starts[i]); cudaEventCreate(&ends[i]);}
 	int finished = 0, model_rows = 0, batch_entries = 0, steps = 0;
-	auto launch = [&](const StepPlan &plan, int parity) {
+	auto launch = [&](const ScheduledBatch &batch, int parity) {
+		const StepPlan &plan = batch.plan;
 		cudaEventRecord(starts[steps], llm.stream());
-		llm.inference(plan, parity, engine, buffers);
+		llm.inference(batch, parity, engine, buffers);
 		cudaEventRecord(ends[steps], llm.stream());
 		model_rows += static_cast<int>(plan.ids.size());
 		batch_entries += static_cast<int>(plan.req_ids.size());

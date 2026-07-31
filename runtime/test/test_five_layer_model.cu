@@ -1,7 +1,6 @@
 // 五层 decoder-only 小模型端到端测试：
 // Scheduler -> PipelineDriver -> Embedding -> 5 x Transformer -> Final RMSNorm -> LM Head -> argmax。
-// 覆盖在线 continuous batching、chunked prefill、decode、混合 batch、
-// 多种 GraphShape 的 bake 和 exec replay。
+// 覆盖在线 continuous batching、chunked prefill、纯 P/D batch 与两套 GraphShape 图族。
 //
 // 编译: nvcc -O2 -arch=sm_120 test_five_layer_model.cu -o test_five_layer_model
 #include "../../model/modules/Embedding.h"
@@ -19,6 +18,7 @@
 #include <memory>
 #include <random>
 #include <string>
+#include <tuple>
 #include <vector>
 
 constexpr int NUM_LAYERS = 5;
@@ -100,7 +100,8 @@ int main() {
 		randomize_parameters(llm);
 		assert(llm.parameters().size() == 48);
 
-		Scheduler scheduler(pool, {MAX_SEQS, MAX_TOKENS, /*eos=*/-1});
+		LocalKvHandoff handoff;
+		Scheduler scheduler(pool, {MAX_SEQS, MAX_TOKENS, /*eos=*/-1}, handoff);
 		auto submit_request = [&](int r) {
 			std::vector<int> prompt(PROMPT_LEN[r]);
 			for (int i = 0; i < PROMPT_LEN[r]; ++i) prompt[i] = (r * 31 + i * 7 + 3) % VOCAB;
@@ -115,32 +116,29 @@ int main() {
 		check_cuda(cudaMalloc(&d_rows, 2 * MAX_SEQS * sizeof(int)));
 		check_cuda(cudaHostAlloc(&h_rows, 2 * MAX_SEQS * sizeof(int), 0));
 
-		bool saw_prefill = false, saw_decode = false, saw_mixed = false, saw_multi_batch = false;
-		bool saw_online_mix = false;
+		bool saw_prefill = false, saw_decode = false, saw_multi_batch = false;
+		bool saw_r0_decode = false, saw_late_prefill = false;
+		bool submitted_late = false;
 		int launched_steps = 0;
-		std::map<std::pair<int, int>, int> shape_counts;
+		std::map<std::tuple<int, int, int>, int> shape_counts;
 		std::vector<std::vector<int>> generated(NREQ);
 
-		auto launch = [&](const StepPlan &plan, int parity) {
+		auto launch = [&](const ScheduledBatch &batch, int parity) {
+			const StepPlan &plan = batch.plan;
 			int B = (int)plan.req_ids.size();
 			int total = 0;
-			bool has_prefill = false, has_decode = false;
-			bool has_r0_decode = false, has_late_prefill = false;
 			for (int b = 0; b < B; ++b) {
-				has_prefill |= plan.lens[b] > 1;
-				has_decode |= plan.lens[b] == 1;
-				has_r0_decode |= plan.req_ids[b] == 0 && plan.lens[b] == 1;
-				has_late_prefill |= plan.req_ids[b] >= 1 && plan.lens[b] > 1;
+				if (batch.phase == ExecutionPhase::DECODE) assert(plan.lens[b] == 1);
+				saw_r0_decode |= batch.phase == ExecutionPhase::DECODE && plan.req_ids[b] == 0;
+				saw_late_prefill |= batch.phase == ExecutionPhase::PREFILL && plan.req_ids[b] >= 1;
 				total += plan.lens[b];
 				h_rows[parity * MAX_SEQS + b] = total - 1;
 			}
 			assert(total == (int)plan.ids.size());
-			saw_prefill |= has_prefill;
-			saw_decode |= has_decode;
-			saw_mixed |= has_prefill && has_decode;
+			saw_prefill |= batch.phase == ExecutionPhase::PREFILL;
+			saw_decode |= batch.phase == ExecutionPhase::DECODE;
 			saw_multi_batch |= B > 1;
-			saw_online_mix |= has_r0_decode && has_late_prefill;
-			shape_counts[{B, total}]++;
+			shape_counts[{batch.phase == ExecutionPhase::PREFILL ? 0 : 1, B, total}]++;
 			++launched_steps;
 
 			check_cuda(cudaMemcpyAsync(token_ids->ptr, plan.ids.data(), total * sizeof(int),
@@ -150,7 +148,7 @@ int main() {
 			                               cudaMemcpyHostToDevice, stream));
 			GraphShape shape = engine.prepare(plan.slots.data(), B, plan.lens.data(), stream);
 			assert(shape.batch == B && shape.total_tokens == total);
-			llm.forward(shape);
+			llm.forward(batch.phase, shape);
 			sample_argmax<<<B, 1, 0, stream>>>(
 				d_sample + parity * MAX_SEQS,
 				static_cast<const float *>(lm_head.out()->ptr),
@@ -174,24 +172,27 @@ int main() {
 				if (state == PipelineDriver::Pump::IDLE) break;
 				if (state != PipelineDriver::Pump::LAUNCHED) continue;
 
-				// r0 的两个 prompt chunk 已发射后加入 r1；再发射一步后加入 r2。
-				// 两次 add_request 都发生在 driver 尚未 idle 的在线生成阶段。
-				if (launched_steps == 2) submit_request(1);
-				if (launched_steps == 3) submit_request(2);
+				if (!submitted_late && launched_steps >= 2) {
+					submit_request(1);
+					submit_request(2);
+					submitted_late = true;
+				}
 			}
 		}
 
-		assert(saw_prefill && saw_decode && saw_mixed && saw_multi_batch);
-		assert(saw_online_mix);
+		assert(saw_prefill && saw_decode && saw_multi_batch);
+		assert(saw_r0_decode && saw_late_prefill);
 		assert(shape_counts.size() >= 3);
 		bool replayed_shape = false;
 		for (const auto &entry : shape_counts) replayed_shape |= entry.second > 1;
 		assert(replayed_shape);
+		assert(llm.num_graphs(ExecutionPhase::PREFILL) > 0);
+		assert(llm.num_graphs(ExecutionPhase::DECODE) > 0);
 		for (int r = 0; r < NREQ; ++r) {
 			assert((int)generated[r].size() == MAX_NEW[r]);
 			for (int token : generated[r]) assert(token >= 0 && token < VOCAB);
 		}
-		assert(scheduler.num_waiting() == 0 && scheduler.num_running() == 0);
+		assert(scheduler.num_requests() == 0);
 		assert(scheduler.num_preemptions() == 0);
 		assert((int)pool.num_free_blocks() == BLOCKS);
 		assert((int)pool.num_free_slots() == MAX_SEQS);
@@ -204,6 +205,6 @@ int main() {
 
 	check_cuda(cudaFree(k_base));
 	check_cuda(cudaFree(v_base));
-	std::printf("test_five_layer_model PASS: online continuous batching + prefill + decode + mixed batch + multi-shape graph replay\n");
+	std::printf("test_five_layer_model PASS: online continuous batching + split prefill/decode graph replay\n");
 	return 0;
 }

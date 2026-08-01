@@ -48,7 +48,7 @@ private:
 int main() {
 	using T = __nv_bfloat16;
 	LLM llm(512);
-	Engine engine(llm.arena(), NH, NKV, HS, MAX_SEQS, MAX_SEQ_LEN);
+	Engine engine(llm.arena(), NH, NKV, HS, MAX_SEQS, MAX_SEQ_LEN, MAX_BATCHED_TOKENS);
 	Tensor *token_ids = llm.arena().alloc({MAX_BATCHED_TOKENS}, Dtype::I32);
 	Embedding<T> embedding(llm, token_ids, MAX_BATCHED_TOKENS, VOCAB, HIDDEN, "model.embed_tokens");
 	std::vector<std::unique_ptr<TinyLlamaBlock<T>>> layers;

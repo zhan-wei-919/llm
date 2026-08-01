@@ -59,15 +59,13 @@ public:
 		free_slots_.push_back(slot);
 	}
 
-	// 把本批序列的页表拍成 [B, max_blocks_per_seq] 供上传, 顺手带出 cur_len
+	// 把本批序列的页表拍成 [B, max_blocks_per_seq] 供上传。
 	// 行宽固定, 每行一次 memcpy; 行尾 padding 不清理, kernel 读不到那里
-	void gather_tables(const int *slots, int B, int *table_out, int *cur_len_out) const {
-		for (int b = 0; b < B; ++b) {
+	void gather_tables(const int *slots, int B, int *table_out) const {
+		for (int b = 0; b < B; ++b)
 			memcpy(table_out + (size_t)b * max_blocks_per_seq_,
 			       &block_table_[(size_t)slots[b] * max_blocks_per_seq_],
 			       max_blocks_per_seq_ * sizeof(int));
-			cur_len_out[b] = len_[slots[b]];
-		}
 	}
 
 	void *k_base(int layer) const {return  static_cast<void*>(static_cast<char*>(k_base_) +(size_t)(layer) * layer_bytes_);}

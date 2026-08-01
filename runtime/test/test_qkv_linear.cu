@@ -210,12 +210,11 @@ static void run_suite(bool has_bias, ErrorStats &stats) {
 	cudaMalloc(&v_base, kv_bytes);
 	{
 		LLM llm(8);
-		Engine engine(llm.arena(), NH, NKV, HS, MAX_SEQS, MAX_SEQ_LEN);
+			Engine engine(llm.arena(), NH, NKV, HS, MAX_SEQS, MAX_SEQ_LEN, MAX_TOKENS);
 		Tensor *input = llm.arena().alloc({MAX_TOKENS, K}, dtype_of<T>::value);
 		QKVLinear<T> qkv(llm, engine, input, MAX_TOKENS, K, 0, has_bias, "attn");
 		assert(llm.parameters().size() == (has_bias ? 6 : 3));
-		assert(llm.parameter_storages().size() == (has_bias ? 2 : 1));
-		assert(llm.parameters().at("attn.q_proj.weight").tensor == qkv.weight());
+			assert(llm.parameters().at("attn.q_proj.weight").tensor == qkv.weight());
 		assert(llm.parameters().at("attn.k_proj.weight").tensor == qkv.weight());
 		assert(llm.parameters().at("attn.v_proj.weight").tensor == qkv.weight());
 		llm.finalize();

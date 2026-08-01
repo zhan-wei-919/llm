@@ -2,14 +2,13 @@
 #include "../kv/KV_pool.h"
 #include <algorithm>
 #include <cassert>
-#include <cstdint>
 #include <deque>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
 enum class ExecutionPhase { PREFILL, DECODE };
-enum class RequestPhase { PREFILL, HANDOFF, DECODE, FINISHED };
+enum class RequestPhase { PREFILL, HANDOFF, DECODE };
 
 // KVCache的使用权
 struct KvLease {
@@ -74,7 +73,6 @@ struct StepPlan {
 };
 
 struct ScheduledBatch {
-	uint64_t	id = 0;
 	ExecutionPhase	phase = ExecutionPhase::PREFILL;
 	StepPlan	plan;
 	bool empty() const {return plan.empty();}
@@ -106,7 +104,7 @@ public:
 		poll_handoffs();
 		StepPlan plan = phase == ExecutionPhase::PREFILL ? schedule_prefill() : schedule_decode();
 		if (plan.empty()) return {};
-		return {next_batch_id_++, phase, std::move(plan)};
+		return {phase, std::move(plan)};
 	}
 
 	std::vector<Request> update(const ScheduledBatch &batch, const std::vector<int> &new_tokens) {
@@ -267,7 +265,6 @@ private:
 			pending_release_.push_back(r.kv);
 			r.kv = {};
 		}
-		r.phase = RequestPhase::FINISHED;
 		done.push_back(std::move(r));
 		requests_.erase(it);
 	}
@@ -277,7 +274,6 @@ private:
 	KvHandoff		&handoff_;
 	const int		total_blocks_;
 	int			next_request_id_ = 0;
-	uint64_t		next_batch_id_ = 0;
 	int			active_leases_ = 0;
 	int			preempt_count_ = 0;
 	RequestMap		requests_;

@@ -28,7 +28,7 @@ int main() {
 
 	{
 		LLM llm(/*max_tensors=*/8);
-		Engine engine(llm.arena(), NH, NKV, HS, MAX_SEQS, MAX_SEQ_LEN);
+		Engine engine(llm.arena(), NH, NKV, HS, MAX_SEQS, MAX_SEQ_LEN, MAX_TOKENS);
 		Tensor *token_ids = llm.arena().alloc({MAX_TOKENS}, Dtype::I32);
 		Embedding<float> embedding(
 			llm, token_ids, MAX_TOKENS, VOCAB, HIDDEN, "model.embed_tokens");

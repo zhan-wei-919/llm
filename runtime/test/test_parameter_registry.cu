@@ -25,10 +25,7 @@ int main() {
 	assert(parameters.at("model.out.weight").tensor->shape[1] == 16);
 	assert(parameters.find("model.out.bias") == parameters.end());
 	assert(parameters.find("model.proj") == parameters.end());
-	assert(llm.parameter_storages().size() == 5);
-
 	llm.finalize();
-	for (Tensor *tensor : llm.parameter_storages()) assert(tensor->ptr != nullptr);
 	std::printf("test_parameter_registry PASS\n");
 	return 0;
 }

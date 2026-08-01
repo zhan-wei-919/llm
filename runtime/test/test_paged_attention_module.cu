@@ -39,12 +39,10 @@ int main() {
 	void *k_base, *v_base;
 	check_cuda(cudaMalloc(&k_base, kv_bytes));
 	check_cuda(cudaMalloc(&v_base, kv_bytes));
-	LLM llm(/*max_tensors=*/7); // Engine meta/cos/sin + q/k/v/out
+	LLM llm(/*max_tensors=*/5); // Engine meta/cos/sin + q/out
 	Engine engine(llm.arena(), NH, NKV, HS, MAX_SEQS, MAX_SEQ_LEN);
 	Tensor *q = llm.arena().alloc({TOKENS, QS}, Dtype::F32);
-	Tensor *k = llm.arena().alloc({TOKENS, KS}, Dtype::F32);
-	Tensor *v = llm.arena().alloc({TOKENS, KS}, Dtype::F32);
-	PagedAttention<float> attention(llm, engine, q, k, v, /*layer=*/0);
+	PagedAttention<float> attention(llm, engine, q, /*layer=*/0);
 	llm.finalize();
 	KV_Pool pool(k_base, v_base, Dtype::F32, KS, kv_bytes,
 	             /*num_layers=*/1, MAX_SEQS, MAX_SEQ_LEN);
@@ -57,11 +55,11 @@ int main() {
 
 	// 第一步: Q 全 0，所以 attention 是前缀 V 的均值，结果全为 2。
 	check_cuda(cudaMemcpy(q->ptr, h_q.data(), h_q.size() * sizeof(float), cudaMemcpyHostToDevice));
-	check_cuda(cudaMemcpy(k->ptr, h_k.data(), h_k.size() * sizeof(float), cudaMemcpyHostToDevice));
-	check_cuda(cudaMemcpy(v->ptr, h_v.data(), h_v.size() * sizeof(float), cudaMemcpyHostToDevice));
 	int slot = engine.alloc_seq();
 	int slots[] = {slot}, lens[] = {TOKENS};
 	GraphShape shape = engine.prepare(slots, 1, lens, prepare_stream);
+	check_cuda(cudaMemcpy(pool.k_base(0), h_k.data(), h_k.size() * sizeof(float), cudaMemcpyHostToDevice));
+	check_cuda(cudaMemcpy(pool.v_base(0), h_v.data(), h_v.size() * sizeof(float), cudaMemcpyHostToDevice));
 	check_cuda(cudaStreamSynchronize(prepare_stream));
 	llm.forward(ExecutionPhase::PREFILL, shape); // 首次见到 shape，bake + launch
 	check_cuda(cudaDeviceSynchronize());
@@ -71,8 +69,11 @@ int main() {
 
 	// 第二步: shape 仍是 {1,3}，但新 V 为 7。应 replay 旧图并读取更新后的元数据。
 	std::fill(h_v.begin(), h_v.end(), 7.0f);
-	check_cuda(cudaMemcpy(v->ptr, h_v.data(), h_v.size() * sizeof(float), cudaMemcpyHostToDevice));
 	GraphShape replay_shape = engine.prepare(slots, 1, lens, prepare_stream);
+	check_cuda(cudaMemcpy(static_cast<float *>(pool.k_base(0)) + TOKENS * KS,
+	                      h_k.data(), h_k.size() * sizeof(float), cudaMemcpyHostToDevice));
+	check_cuda(cudaMemcpy(static_cast<float *>(pool.v_base(0)) + TOKENS * KS,
+	                      h_v.data(), h_v.size() * sizeof(float), cudaMemcpyHostToDevice));
 	assert(replay_shape == shape);
 	check_cuda(cudaStreamSynchronize(prepare_stream));
 	llm.forward(ExecutionPhase::PREFILL, replay_shape); // 同 shape，直接 replay

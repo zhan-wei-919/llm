@@ -16,18 +16,19 @@ int main() {
 
 	const auto &parameters = llm.parameters();
 	assert(parameters.size() == 5);
-	assert(parameters.at("model.embed_tokens.weight") == embedding.weight());
-	assert(parameters.at("model.norm.weight")->shape[0] == 16);
-	assert(parameters.at("model.proj.weight")->shape[0] == 16);
-	assert(parameters.at("model.proj.weight")->shape[1] == 12);
-	assert(parameters.at("model.proj.bias")->shape[0] == 12);
-	assert(parameters.at("model.out.weight")->shape[0] == 12);
-	assert(parameters.at("model.out.weight")->shape[1] == 16);
+	assert(parameters.at("model.embed_tokens.weight").tensor == embedding.weight());
+	assert(parameters.at("model.norm.weight").tensor->shape[0] == 16);
+	assert(parameters.at("model.proj.weight").tensor->shape[0] == 16);
+	assert(parameters.at("model.proj.weight").tensor->shape[1] == 12);
+	assert(parameters.at("model.proj.bias").tensor->shape[0] == 12);
+	assert(parameters.at("model.out.weight").tensor->shape[0] == 12);
+	assert(parameters.at("model.out.weight").tensor->shape[1] == 16);
 	assert(parameters.find("model.out.bias") == parameters.end());
 	assert(parameters.find("model.proj") == parameters.end());
+	assert(llm.parameter_storages().size() == 5);
 
 	llm.finalize();
-	for (const auto &entry : parameters) assert(entry.second->ptr != nullptr);
+	for (Tensor *tensor : llm.parameter_storages()) assert(tensor->ptr != nullptr);
 	std::printf("test_parameter_registry PASS\n");
 	return 0;
 }

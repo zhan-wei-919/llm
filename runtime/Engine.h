@@ -7,12 +7,13 @@
 #include "../kernel/attention/GQAttention_prefill.h"
 #include "../kernel/embedding/RoPECache.h"
 #include "../kernel/embedding/RoPE.h"
+#include "../kernel/Gemm/QKVGemm.h"
 #include "GraphShape.h"
 
 // Engine: 把"一步推理"翻译成固定的操作序列
 //   记账 (调 pool) → 收集 (gather_tables) → 搬运 (memcpy 上传) → 发射 (kernel)
 // 只借不占: pool 和 device 工作数组由装配层构造好递进来, 这里不做任何显存分配.
-// scatter 和 attention 在同一个 stream 上按发射顺序执行, 先写后读天然成立,
+// QKV 落池和 attention 在同一个 stream 上按发射顺序执行, 先写后读天然成立,
 // 所以全程不需要显式同步.
 class Engine {
 public:
@@ -23,11 +24,13 @@ public:
 	// len:        S           个 int
 	// pos:        S           个 int
 	// seq_ids:    S * L       个 int   (最坏情况)
+	// positions:  S * L       个 int
+	// kv_dst:     S * L       个 int
 	// cu_seqlens: S + 1       个 int
 	Engine(Arena &arena, int NH, int NKV, int HS, int max_seqs, int max_seq_len)
 	: arena_(arena), NH_(NH), NKV_(NKV), HS_(HS) {
 		int S = max_seqs, W = (max_seq_len + KV_BLOCK_SIZE - 1) / KV_BLOCK_SIZE, L = W * KV_BLOCK_SIZE;
-		total_ints_ = S * W + S + S + S * L + S + 1;
+		total_ints_ = S * W + S + S + 3 * S * L + S + 1;
 		meta_ = arena_.alloc({total_ints_}, Dtype::I32);
 		cos_ = arena_.alloc({L, HS / 2}, Dtype::F32);
 		sin_ = arena_.alloc({L, HS / 2}, Dtype::F32);
@@ -40,6 +43,8 @@ public:
 		d_len_		= d_base;	d_base += S;
 		d_pos_		= d_base;	d_base += S;
 		d_seq_ids_	= d_base;	d_base += S * L;
+		d_positions_	= d_base;	d_base += S * L;
+		d_kv_dst_	= d_base;	d_base += S * L;
 		d_cu_seqlens_	= d_base;
 		cudaHostAlloc(&h_base_, 2 * total_ints_ * sizeof(int), 0);
 		h_half_[0] = h_base_; h_half_[1] = h_base_ + total_ints_;
@@ -59,10 +64,42 @@ public:
 		}
 		current_total_ = h_cu_seqlens_[B];
 		pool_->gather_tables(slots, B, h_table_, h_len_);
-		for (int b = 0, t = 0; b < B; ++b)			// 展开: 第 b 段的 lens[b] 行都属于 b
-			for (int i = 0; i < lens[b]; ++i) h_seq_ids_[t++] = b;
+		for (int b = 0, t = 0; b < B; ++b) {
+			for (int i = 0; i < lens[b]; ++i, ++t) {
+				int p = h_pos_[b] + i;
+				h_seq_ids_[t] = b;
+				h_positions_[t] = p;
+				h_kv_dst_[t] = pool_->physical_token(slots[b], p);
+			}
+		}
 		upload(stream);
 		return {current_B_, current_total_};
+	}
+
+	// 融合完成 QKV 投影、Q/K RoPE，并把当前层 K/V 写入 prepare 预先计算的物理位置。
+	void forward_qkv(int layer, const __nv_bfloat16 *input, const __nv_bfloat16 *weight,
+	                 const __nv_bfloat16 *bias, __nv_bfloat16 *q, int K, cudaStream_t stream) {
+		launch_qkv_gemm_bf16(input, weight, bias, q,
+			static_cast<__nv_bfloat16 *>(pool_->k_base(layer)),
+			static_cast<__nv_bfloat16 *>(pool_->v_base(layer)),
+			d_positions_, d_kv_dst_, static_cast<const float *>(cos_->ptr),
+			static_cast<const float *>(sin_->ptr),
+			current_total_, K, NH_, NKV_, HS_, stream);
+	}
+
+	// 当前层 K/V 已经落池，本函数只执行分页 Attention。
+	void forward_attention(int layer, const void *q, void *out, cudaStream_t stream) {
+		auto k_base = pool_->k_base(layer);
+		auto v_base = pool_->v_base(layer);
+		int W = pool_->max_blocks_per_seq();
+		dtype_dispatch(pool_->dtype(), [&](auto tag) {
+			using T_ = typename decltype(tag)::type;
+			launch_gq_attention_prefill<T_>(
+				static_cast<T_ *>(out), static_cast<const T_ *>(q),
+				static_cast<const T_ *>(k_base), static_cast<const T_ *>(v_base),
+				d_cu_seqlens_, d_seq_ids_, d_pos_, d_table_,
+				current_B_, NH_, NKV_, HS_, W, current_total_, stream);
+		});
 	}
 
 	// forward: phase 无关的统一算子路径. 本批 B 条同 phase 序列首尾相接打包,
@@ -123,6 +160,8 @@ private:
 		h_len_        = p;   p += S;
 		h_pos_        = p;   p += S;
 		h_seq_ids_    = p;   p += S * L;
+		h_positions_  = p;   p += S * L;
+		h_kv_dst_     = p;   p += S * L;
 		h_cu_seqlens_ = p;
 	}
 
@@ -132,7 +171,9 @@ private:
 	int total_ints_ = 0;
 	int *d_base_ = nullptr, *h_base_ = nullptr;
 	int *d_table_ = nullptr, *d_len_ = nullptr, *d_pos_ = nullptr, *d_seq_ids_ = nullptr, *d_cu_seqlens_ = nullptr;
+	int *d_positions_ = nullptr, *d_kv_dst_ = nullptr;
 	int *h_table_ = nullptr, *h_len_ = nullptr, *h_pos_ = nullptr, *h_seq_ids_ = nullptr, *h_cu_seqlens_ = nullptr;
+	int *h_positions_ = nullptr, *h_kv_dst_ = nullptr;
 
 	Tensor *meta_ = nullptr, *cos_ = nullptr, *sin_ = nullptr;
 

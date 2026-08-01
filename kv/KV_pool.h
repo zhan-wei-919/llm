@@ -74,6 +74,12 @@ public:
 
 	void *v_base(int layer) const {return static_cast<void*>(static_cast<char*>(v_base_) + (size_t)(layer) * layer_bytes_);}
 
+	// 把序列逻辑位置转换为层内 KV Pool 的物理 token 下标。
+	int physical_token(int slot, int position) const {
+		int phys = block_table_[(size_t)slot * max_blocks_per_seq_ + position / KV_BLOCK_SIZE];
+		return phys * KV_BLOCK_SIZE + position % KV_BLOCK_SIZE;
+	}
+
 	int seq_len(int slot) const { return len_[slot]; }
 	int max_seqs() const { return max_seqs_; }
 	int max_blocks_per_seq() const { return max_blocks_per_seq_; }

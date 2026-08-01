@@ -27,6 +27,14 @@ inline constexpr uint64_t SAFETENSOR_LOAD_BUFFER_BYTES = 1ull << 30;
 class LLM {
 	friend class Module;
 public:
+	struct ParameterBinding {
+		Tensor *tensor;
+		int column_offset;
+		int columns;
+		int head_dim;
+		bool sliced;
+	};
+
 	// wait=false: 非阻塞取当前输入; wait=true: server idle 时阻塞等待。
 	// idle 等待返回 nullopt 时，server 退出。
 	using ReceiveFn = std::function<std::optional<std::string>(bool wait)>;
@@ -66,11 +74,25 @@ public:
 
 	Arena &arena() {return arena_;}
 	Tensor *parameter(std::string name, std::initializer_list<int> shape, Dtype dtype) {
-		Tensor *tensor = arena_.alloc(shape, dtype);
-		parameters_.emplace(std::move(name), tensor);
+		Tensor *tensor = parameter_storage(shape, dtype);
+		parameters_.emplace(std::move(name), ParameterBinding{tensor, 0, 0, 0, false});
 		return tensor;
 	}
-	const std::unordered_map<std::string, Tensor *> &parameters() const {return parameters_;}
+
+	// 创建由多个 checkpoint 参数共同填充的唯一物理存储。
+	Tensor *parameter_storage(std::initializer_list<int> shape, Dtype dtype) {
+		Tensor *tensor = arena_.alloc(shape, dtype);
+		parameter_storages_.push_back(tensor);
+		return tensor;
+	}
+
+	// 把一个逻辑 checkpoint 参数绑定到融合 Tensor 的列切片；head_dim>0 时按 RoPE 配对顺序装载。
+	void bind_parameter_slice(std::string name, Tensor *tensor, int column_offset, int columns, int head_dim = 0) {
+		parameters_.emplace(std::move(name), ParameterBinding{tensor, column_offset, columns, head_dim, true});
+	}
+
+	const std::unordered_map<std::string, ParameterBinding> &parameters() const {return parameters_;}
+	const std::vector<Tensor *> &parameter_storages() const {return parameter_storages_;}
 	cudaStream_t stream() const {return stream_;}
 
 	// std::vector<std::string> need_transpose = {".q_proj.weight", ".k_proj.weight", ... ,"lm_head.weight"};
@@ -84,7 +106,7 @@ public:
 	void load_safetensor(const std::string &path, F transpose) {
 		struct LoadItem {
 			std::string name;
-			Tensor *tensor;
+			ParameterBinding binding;
 			layer_info info;
 		};
 
@@ -118,22 +140,54 @@ public:
 				const LoadItem &item = items[k];
 				size_t bytes = static_cast<size_t>(item.info.end - item.info.start);
 				const char *source = buffer.data() + (item.info.start - batch_start);
-				if (!transpose(item.name)) {
-					cudaMemcpy(item.tensor->ptr, source, bytes, cudaMemcpyHostToDevice);
+				bool do_transpose = transpose(item.name);
+				if (!item.binding.sliced && !do_transpose) {
+					cudaMemcpy(item.binding.tensor->ptr, source, bytes, cudaMemcpyHostToDevice);
 					continue;
 				}
 
-				size_t rows = static_cast<size_t>(item.info.shape[0]);
-				size_t cols = static_cast<size_t>(item.info.shape[1]);
 				size_t element_bytes = dtype_size(item.info.d);
-				std::vector<char> transposed(bytes);
-				for (size_t r = 0; r < rows; ++r)
-					for (size_t c = 0; c < cols; ++c)
-						std::memcpy(
-							transposed.data() + (c * rows + r) * element_bytes,
-							source + (r * cols + c) * element_bytes,
-							element_bytes);
-				cudaMemcpy(item.tensor->ptr, transposed.data(), bytes, cudaMemcpyHostToDevice);
+				if (!item.binding.sliced) {
+					size_t rows = static_cast<size_t>(item.info.shape[0]);
+					size_t cols = static_cast<size_t>(item.info.shape[1]);
+					std::vector<char> transposed(bytes);
+					for (size_t r = 0; r < rows; ++r)
+						for (size_t c = 0; c < cols; ++c)
+							std::memcpy(transposed.data() + (c * rows + r) * element_bytes,
+							            source + (r * cols + c) * element_bytes, element_bytes);
+					cudaMemcpy(item.binding.tensor->ptr, transposed.data(), bytes, cudaMemcpyHostToDevice);
+					continue;
+				}
+
+				// 切片装载直接生成目标列序，避免先转置再创建第二份大临时缓冲。
+				int rank = static_cast<int>(item.info.shape.size());
+				int source_rows = rank == 1 ? 1 : item.info.shape[0];
+				int source_cols = rank == 1 ? item.info.shape[0] : item.info.shape[1];
+				int rows = rank == 1 ? 1 : (do_transpose ? source_cols : source_rows);
+				int columns = item.binding.columns;
+				int head_dim = item.binding.head_dim, half = head_dim / 2;
+				std::vector<char> packed((size_t)rows * columns * element_bytes);
+				for (int r = 0; r < rows; ++r) {
+					for (int c = 0; c < columns; ++c) {
+						int packed_col = c;
+						if (head_dim) {
+							int h = c / head_dim, d = c % head_dim;
+							packed_col = h * head_dim + (d < half ? 2 * d : 2 * (d - half) + 1);
+						}
+						size_t source_index = rank == 1 ? c :
+							(do_transpose ? (size_t)c * source_cols + r : (size_t)r * source_cols + c);
+						std::memcpy(packed.data() + ((size_t)r * columns + packed_col) * element_bytes,
+						            source + source_index * element_bytes, element_bytes);
+					}
+				}
+				char *target = static_cast<char *>(item.binding.tensor->ptr) + (size_t)item.binding.column_offset * element_bytes;
+				if (item.binding.tensor->ndim == 1) {
+					cudaMemcpy(target, packed.data(), packed.size(), cudaMemcpyHostToDevice);
+				} else {
+					size_t target_pitch = (size_t)item.binding.tensor->shape[1] * element_bytes;
+					size_t row_bytes = (size_t)columns * element_bytes;
+					cudaMemcpy2D(target, target_pitch, packed.data(), row_bytes, row_bytes, rows, cudaMemcpyHostToDevice);
+				}
 			}
 			i = j;
 		}
@@ -224,7 +278,8 @@ private:
 
 	Arena arena_;
 	std::vector<OpRecord> program_;
-	std::unordered_map<std::string, Tensor *> parameters_;
+	std::unordered_map<std::string, ParameterBinding> parameters_;
+	std::vector<Tensor *> parameter_storages_;
 	cudaStream_t stream_;
 	std::array<std::unordered_map<GraphShape, cudaGraphExec_t, GraphShapeHash>, 2> graphs_;
 

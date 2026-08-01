@@ -44,27 +44,26 @@ static void check_cuda(cudaError_t err) {
 static void randomize_parameters(LLM &llm) {
 	std::mt19937 rng(42);
 	std::uniform_real_distribution<float> dist(-0.05f, 0.05f);
-	for (const auto &entry : llm.parameters()) {
-		Tensor *tensor = entry.second;
-		assert(tensor->dtype == Dtype::F32);
-		std::vector<float> values(tensor->numel());
-		for (float &value : values) value = dist(rng);
+	for (Tensor *tensor : llm.parameter_storages()) {
+		assert(tensor->dtype == Dtype::BF16);
+		std::vector<__nv_bfloat16> values(tensor->numel());
+		for (__nv_bfloat16 &value : values) value = __float2bfloat16(dist(rng));
 		check_cuda(cudaMemcpy(tensor->ptr, values.data(), tensor->bytes(), cudaMemcpyHostToDevice));
 	}
 }
 
 // 每个 batch 条目只对本步最后一行 logits 做 argmax。
-__global__ void sample_argmax(int *tokens, const float *logits, const int *rows) {
+__global__ void sample_argmax(int *tokens, const __nv_bfloat16 *logits, const int *rows) {
 	int b = blockIdx.x;
-	const float *row = logits + (size_t)rows[b] * VOCAB;
+	const __nv_bfloat16 *row = logits + (size_t)rows[b] * VOCAB;
 	int best = 0;
 	for (int v = 1; v < VOCAB; ++v)
-		if (row[v] > row[best]) best = v;
+		if (__bfloat162float(row[v]) > __bfloat162float(row[best])) best = v;
 	tokens[b] = best;
 }
 
 int main() {
-	const size_t layer_bytes = (size_t)BLOCKS * KV_BLOCK_SIZE * NKV * HS * sizeof(float);
+	const size_t layer_bytes = (size_t)BLOCKS * KV_BLOCK_SIZE * NKV * HS * sizeof(__nv_bfloat16);
 	const size_t kv_bytes = NUM_LAYERS * layer_bytes;
 	void *k_base, *v_base;
 	check_cuda(cudaMalloc(&k_base, kv_bytes));
@@ -74,25 +73,25 @@ int main() {
 		cudaStream_t stream = llm.stream();
 		Engine engine(llm.arena(), NH, NKV, HS, MAX_SEQS, MAX_SEQ_LEN);
 		Tensor *token_ids = llm.arena().alloc({MAX_TOKENS}, Dtype::I32);
-		Embedding<float> embedding(llm, token_ids, MAX_TOKENS, VOCAB, HIDDEN,
+		Embedding<__nv_bfloat16> embedding(llm, token_ids, MAX_TOKENS, VOCAB, HIDDEN,
 		                           "model.embed_tokens");
 
-		std::vector<std::unique_ptr<Transformer<float>>> layers;
+		std::vector<std::unique_ptr<Transformer<__nv_bfloat16>>> layers;
 		layers.reserve(NUM_LAYERS);
 		Tensor *x = embedding.out();
 		for (int layer = 0; layer < NUM_LAYERS; ++layer) {
-			layers.emplace_back(std::make_unique<Transformer<float>>(
+			layers.emplace_back(std::make_unique<Transformer<__nv_bfloat16>>(
 				llm, engine, x, MAX_TOKENS, HIDDEN, layer, FC_DIM,
 				/*qkv_bias=*/false, /*o_bias=*/false, /*fc_bias=*/false,
 				1e-5f, "model.layers." + std::to_string(layer)));
 			x = layers.back()->out();
 		}
-		RMSNorm<float> final_norm(llm, x, MAX_TOKENS, HIDDEN, 1e-5f, "model.norm");
-		LMHead<float> lm_head(llm, final_norm.out(), MAX_TOKENS, HIDDEN, VOCAB,
+		RMSNorm<__nv_bfloat16> final_norm(llm, x, MAX_TOKENS, HIDDEN, 1e-5f, "model.norm");
+		LMHead<__nv_bfloat16> lm_head(llm, final_norm.out(), MAX_TOKENS, HIDDEN, VOCAB,
 		                          "lm_head");
 
 		llm.finalize();
-		KV_Pool pool(k_base, v_base, Dtype::F32, NKV * HS, kv_bytes,
+		KV_Pool pool(k_base, v_base, Dtype::BF16, NKV * HS, kv_bytes,
 		             NUM_LAYERS, MAX_SEQS, MAX_SEQ_LEN);
 		engine.bind_pool(&pool);
 		engine.init_rope(stream);
@@ -151,7 +150,7 @@ int main() {
 			llm.forward(batch.phase, shape);
 			sample_argmax<<<B, 1, 0, stream>>>(
 				d_sample + parity * MAX_SEQS,
-				static_cast<const float *>(lm_head.out()->ptr),
+				static_cast<const __nv_bfloat16 *>(lm_head.out()->ptr),
 				d_rows + parity * MAX_SEQS);
 			check_cuda(cudaMemcpyAsync(h_sample + parity * MAX_SEQS,
 			                               d_sample + parity * MAX_SEQS, B * sizeof(int),

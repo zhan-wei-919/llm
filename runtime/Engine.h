@@ -3,7 +3,6 @@
 #include "../kv/KV_pool.h"
 #include "../tensor/Tensor.h"
 #include "../tensor/Arena.h"
-#include "../kernel/attention/Scatter_kv.h"
 #include "../kernel/attention/GQAttention_prefill.h"
 #include "../kernel/embedding/RoPECache.h"
 #include "../kernel/embedding/RoPE.h"
@@ -97,28 +96,6 @@ public:
 			launch_gq_attention_prefill<T_>(
 				static_cast<T_ *>(out), static_cast<const T_ *>(q),
 				static_cast<const T_ *>(k_base), static_cast<const T_ *>(v_base),
-				d_cu_seqlens_, d_seq_ids_, d_pos_, d_table_,
-				current_B_, NH_, NKV_, HS_, W, current_total_, stream);
-		});
-	}
-
-	// forward: phase 无关的统一算子路径. 本批 B 条同 phase 序列首尾相接打包,
-	// Decode 的 lens 全为 1，Prefill 的 lens 是各自 chunk 长度.
-	// q: [total, NH*HS], k/v: [total, NKV*HS] 稠密激活, out: [total, NH*HS]
-	// scatter 先把本步 k/v 写进 pool, attention 经页表读 [0, pos+i] 的全部前缀
-	void forward_layer(int layer, const void *q, const void *k, const void *v, void *out, cudaStream_t stream){
-		auto k_base = pool_->k_base(layer);
-		auto v_base = pool_->v_base(layer);
-		int W = pool_->max_blocks_per_seq();
-		dtype_dispatch(pool_->dtype(), [&](auto tag) {
-			using T_ = typename decltype(tag)::type;
-			launch_scatter_kv<T_>(
-				(T_ *)k_base, (T_ *)v_base,
-				(const T_ *)k, (const T_ *)v,
-				d_table_, d_cu_seqlens_, d_seq_ids_, d_pos_,
-				current_total_, NKV_, HS_, W, stream);
-			launch_gq_attention_prefill<T_>(
-				(T_ *)out, (const T_ *)q, (const T_ *)k_base, (const T_ *)v_base,
 				d_cu_seqlens_, d_seq_ids_, d_pos_, d_table_,
 				current_B_, NH_, NKV_, HS_, W, current_total_, stream);
 		});

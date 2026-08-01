@@ -1,6 +1,6 @@
 #pragma once
 #include <cstdint>
-#include "GQAttention_prefill.h"
+#include "attention_NH_32_NKV_4_HS_64.h"
 
 template<typename T>
 // Q=[total,NH,HS]，K/V=[blocks,KV_BLOCK_SIZE,NKV,HS]；B、total、window_size 由 launcher 处理。

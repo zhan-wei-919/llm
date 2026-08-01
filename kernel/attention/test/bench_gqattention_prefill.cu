@@ -56,7 +56,7 @@ int main() {
 		cudaMemcpy(seq_ids, h_seq.data(), total * sizeof(int), cudaMemcpyHostToDevice);
 		cudaMemcpy(pos_offset, &zero, sizeof(int), cudaMemcpyHostToDevice);
 		cudaMemcpy(block_table, h_table.data(), blocks * sizeof(int), cudaMemcpyHostToDevice);
-		auto run = [&] {launch_gq_attention_prefill(out, q, k, v, cu_seqlens, seq_ids, pos_offset, block_table, B, NH, NKV, HS, blocks, total, 0);};
+		auto run = [&] {launch_gq_attention_prefill(out, q, k, v, cu_seqlens, seq_ids, pos_offset, block_table, B, NH, NKV, HS, blocks, total, -1, 0);};
 		float us = time_us(run, 20, 100);
 		printf("T=%d custom=%.3f us\n", total, us);
 		cudaFree(q);

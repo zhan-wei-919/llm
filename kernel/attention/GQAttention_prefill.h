@@ -18,12 +18,12 @@ __device__ __forceinline__ float gqa_group_sum(float x) {
 	return x;
 }
 
-template<int K_TILE, int Q_TILES, bool SWAP_GRID>
+template<int K_TILE, int Q_TILES, bool SWAP_GRID, bool SLIDING>
 // BF16 GQA 专用核：固定 NH=32、NKV=4、HS=64，直接从分页 KV Pool 完成 causal attention。
 __global__ __launch_bounds__(GQA_HEAD_WARPS * Q_TILES * 32, (Q_TILES == 1 ? (K_TILE == 32 ? 4 : 3) : 2)) void gq_attention_prefill_bf16_h64(
 	__nv_bfloat16 *__restrict__ out, const __nv_bfloat16 *__restrict__ q,
 	const __nv_bfloat16 *__restrict__ k_pool, const __nv_bfloat16 *__restrict__ v_pool,
-	const int *__restrict__ pos_offset, const int *__restrict__ block_table, int total
+	const int *__restrict__ pos_offset, const int *__restrict__ block_table, int total, int window_size
 ) {
 #if __CUDA_ARCH__ >= 800
 	constexpr int QLD = 64 + GQA_PAD, KLD = K_TILE + GQA_PAD, VLD = 64 + GQA_PAD;
@@ -36,6 +36,7 @@ __global__ __launch_bounds__(GQA_HEAD_WARPS * Q_TILES * 32, (Q_TILES == 1 ? (K_T
 	int g = head_block / HEAD_SPLITS;
 	int h = g * GQA_GROUP + (head_block % HEAD_SPLITS) * GQA_HEAD_WARPS + (warp / Q_TILES);
 	int pos = pos_offset[0], q_last = min(q_base + Q_BLOCK - 1, total - 1);
+	int key_begin = SLIDING ? max(0, pos + q_base + 1 - window_size) : 0;
 	int key_limit = pos + q_last + 1;
 	extern __shared__ char smem[];
 	auto *sq = reinterpret_cast<__nv_bfloat16*>(smem);
@@ -67,7 +68,7 @@ __global__ __launch_bounds__(GQA_HEAD_WARPS * Q_TILES * 32, (Q_TILES == 1 ? (K_T
 	const int *table = block_table;
 	constexpr int kv_stride = 4 * 64;
 
-	for (int key0 = 0; key0 < key_limit; key0 += K_TILE) {
+	for (int key0 = key_begin; key0 < key_limit; key0 += K_TILE) {
 		for (int e = tid; e < K_TILE * 8; e += blockDim.x) {
 			int r = e >> 3, d = (e & 7) * 8, key = key0 + r;
 			uint4 kval = {}, vval = {};
@@ -106,14 +107,16 @@ __global__ __launch_bounds__(GQA_HEAD_WARPS * Q_TILES * 32, (Q_TILES == 1 ? (K_T
 
 		int rg = lane >> 2, cg = (lane & 3) * 2;
 		int qrow0 = q0 + rg, qrow1 = qrow0 + 8;
+		int begin0 = SLIDING ? max(0, pos + qrow0 + 1 - window_size) : 0;
+		int begin1 = SLIDING ? max(0, pos + qrow1 + 1 - window_size) : 0;
 		float tile_m0 = -INFINITY, tile_m1 = -INFINITY;
 		#pragma unroll
 		for (int ni = 0; ni < K_TILE / 8; ++ni) {
 			int c = ni * 8 + cg, key = key0 + c;
-			score_acc[ni][0] = qrow0 < total && key <= pos + qrow0 ? score_acc[ni][0] * scale : -INFINITY;
-			score_acc[ni][1] = qrow0 < total && key + 1 <= pos + qrow0 ? score_acc[ni][1] * scale : -INFINITY;
-			score_acc[ni][2] = qrow1 < total && key <= pos + qrow1 ? score_acc[ni][2] * scale : -INFINITY;
-			score_acc[ni][3] = qrow1 < total && key + 1 <= pos + qrow1 ? score_acc[ni][3] * scale : -INFINITY;
+			score_acc[ni][0] = qrow0 < total && key >= begin0 && key <= pos + qrow0 ? score_acc[ni][0] * scale : -INFINITY;
+			score_acc[ni][1] = qrow0 < total && key + 1 >= begin0 && key + 1 <= pos + qrow0 ? score_acc[ni][1] * scale : -INFINITY;
+			score_acc[ni][2] = qrow1 < total && key >= begin1 && key <= pos + qrow1 ? score_acc[ni][2] * scale : -INFINITY;
+			score_acc[ni][3] = qrow1 < total && key + 1 >= begin1 && key + 1 <= pos + qrow1 ? score_acc[ni][3] * scale : -INFINITY;
 			tile_m0 = fmaxf(tile_m0, fmaxf(score_acc[ni][0], score_acc[ni][1]));
 			tile_m1 = fmaxf(tile_m1, fmaxf(score_acc[ni][2], score_acc[ni][3]));
 		}
@@ -192,8 +195,41 @@ __global__ __launch_bounds__(GQA_HEAD_WARPS * Q_TILES * 32, (Q_TILES == 1 ? (K_T
 #endif
 }
 
+template<bool SLIDING>
+// 配置共享内存并按 total 选择 tile。
+void launch_gq_attention_prefill_bf16_h64(
+	__nv_bfloat16 *out, const __nv_bfloat16 *q, const __nv_bfloat16 *k_pool,
+	const __nv_bfloat16 *v_pool, const int *pos_offset, const int *block_table,
+	int NKV, int total, int window_size, cudaStream_t stream
+) {
+	static bool configured = [] {
+		cudaFuncSetAttribute(gq_attention_prefill_bf16_h64<32, 1, false, SLIDING>, cudaFuncAttributeMaxDynamicSharedMemorySize, GQA_SMEM_Q1_K32);
+		cudaFuncSetAttribute(gq_attention_prefill_bf16_h64<32, 1, false, SLIDING>, cudaFuncAttributePreferredSharedMemoryCarveout, 50);
+		cudaFuncSetAttribute(gq_attention_prefill_bf16_h64<64, 1, true, SLIDING>, cudaFuncAttributeMaxDynamicSharedMemorySize, GQA_SMEM_Q1_K64);
+		cudaFuncSetAttribute(gq_attention_prefill_bf16_h64<64, 1, true, SLIDING>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+		cudaFuncSetAttribute(gq_attention_prefill_bf16_h64<32, 2, false, SLIDING>, cudaFuncAttributeMaxDynamicSharedMemorySize, GQA_SMEM_Q2_K32);
+		cudaFuncSetAttribute(gq_attention_prefill_bf16_h64<32, 2, false, SLIDING>, cudaFuncAttributePreferredSharedMemoryCarveout, 50);
+		return true;
+	}();
+	(void)configured;
+	int grid_y = NKV * (GQA_GROUP / GQA_HEAD_WARPS);
+	if (total <= 128) {
+		dim3 grid((total + GQA_Q_TILE * 2 - 1) / (GQA_Q_TILE * 2), grid_y);
+		gq_attention_prefill_bf16_h64<32, 2, false, SLIDING><<<grid, GQA_HEAD_WARPS * 2 * 32, GQA_SMEM_Q2_K32, stream>>>(
+			out, q, k_pool, v_pool, pos_offset, block_table, total, window_size);
+	} else if (total <= 256) {
+		dim3 grid((total + GQA_Q_TILE - 1) / GQA_Q_TILE, grid_y);
+		gq_attention_prefill_bf16_h64<32, 1, false, SLIDING><<<grid, GQA_HEAD_WARPS * 32, GQA_SMEM_Q1_K32, stream>>>(
+			out, q, k_pool, v_pool, pos_offset, block_table, total, window_size);
+	} else {
+		dim3 grid(grid_y, (total + GQA_Q_TILE - 1) / GQA_Q_TILE);
+		gq_attention_prefill_bf16_h64<64, 1, true, SLIDING><<<grid, GQA_HEAD_WARPS * 32, GQA_SMEM_Q1_K64, stream>>>(
+			out, q, k_pool, v_pool, pos_offset, block_table, total, window_size);
+	}
+}
+
 template <typename T>
-// 根据 total 选择 Q_TILE/K_TILE 配置并发射 BF16 GQA 专用核。
+// window_size=-1 读取完整历史，正数读取包含当前 token 的最近窗口。
 void launch_gq_attention_prefill(
 	T 		*__restrict__ out, 		// [total, NH * HS]
 	const T 	*__restrict__ q,		// [total, NH * HS]
@@ -203,34 +239,14 @@ void launch_gq_attention_prefill(
 	const int	*__restrict__ seq_ids,		// [total]
 	const int	*__restrict__ pos_offset,	// [B]		// [64, 128, 512]每个位置表明这是prefill里的第几个chunk
 	const int 	*__restrict__ block_table,	// [B, max_blocks_per_seq]
-	int B, int NH, int NKV, int HS, int max_blocks_per_seq, int total, cudaStream_t t
+	int B, int NH, int NKV, int HS, int max_blocks_per_seq, int total, int window_size, cudaStream_t t
 ) {
 	if constexpr (std::is_same<T, __nv_bfloat16>::value) {
 		if (B == 1 && NH == 32 && NKV == 4 && HS == 64) {
-			static bool configured = [] {
-				cudaFuncSetAttribute(gq_attention_prefill_bf16_h64<32, 1, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, GQA_SMEM_Q1_K32);
-				cudaFuncSetAttribute(gq_attention_prefill_bf16_h64<32, 1, false>, cudaFuncAttributePreferredSharedMemoryCarveout, 50);
-				cudaFuncSetAttribute(gq_attention_prefill_bf16_h64<64, 1, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, GQA_SMEM_Q1_K64);
-				cudaFuncSetAttribute(gq_attention_prefill_bf16_h64<64, 1, true>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
-				cudaFuncSetAttribute(gq_attention_prefill_bf16_h64<32, 2, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, GQA_SMEM_Q2_K32);
-				cudaFuncSetAttribute(gq_attention_prefill_bf16_h64<32, 2, false>, cudaFuncAttributePreferredSharedMemoryCarveout, 50);
-				return true;
-			}();
-			(void)configured;
-			int grid_y = NKV * (GQA_GROUP / GQA_HEAD_WARPS);
-			if (total <= 128) {
-				dim3 grid((total + GQA_Q_TILE * 2 - 1) / (GQA_Q_TILE * 2), grid_y);
-				gq_attention_prefill_bf16_h64<32, 2, false><<<grid, GQA_HEAD_WARPS * 2 * 32, GQA_SMEM_Q2_K32, t>>>(
-					out, q, k_pool, v_pool, pos_offset, block_table, total);
-			} else if (total <= 256) {
-				dim3 grid((total + GQA_Q_TILE - 1) / GQA_Q_TILE, grid_y);
-				gq_attention_prefill_bf16_h64<32, 1, false><<<grid, GQA_HEAD_WARPS * 32, GQA_SMEM_Q1_K32, t>>>(
-					out, q, k_pool, v_pool, pos_offset, block_table, total);
-			} else {
-				dim3 grid(grid_y, (total + GQA_Q_TILE - 1) / GQA_Q_TILE);
-				gq_attention_prefill_bf16_h64<64, 1, true><<<grid, GQA_HEAD_WARPS * 32, GQA_SMEM_Q1_K64, t>>>(
-					out, q, k_pool, v_pool, pos_offset, block_table, total);
-			}
+			if (window_size < 0)
+				launch_gq_attention_prefill_bf16_h64<false>(out, q, k_pool, v_pool, pos_offset, block_table, NKV, total, window_size, t);
+			else
+				launch_gq_attention_prefill_bf16_h64<true>(out, q, k_pool, v_pool, pos_offset, block_table, NKV, total, window_size, t);
 			return;
 		}
 	}

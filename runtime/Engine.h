@@ -86,8 +86,8 @@ public:
 			current_total_, K, NH_, NKV_, HS_, stream);
 	}
 
-	// 当前层 K/V 已经落池，本函数只执行分页 Attention。
-	void forward_attention(int layer, const void *q, void *out, cudaStream_t stream) {
+	// 当前层 K/V 已经落池；window_size=-1 读取完整历史，正数读取包含当前 token 的最近窗口。
+	void forward_attention(int layer, const void *q, void *out, int window_size, cudaStream_t stream) {
 		auto k_base = pool_->k_base(layer);
 		auto v_base = pool_->v_base(layer);
 		int W = pool_->max_blocks_per_seq();
@@ -97,7 +97,7 @@ public:
 				static_cast<T_ *>(out), static_cast<const T_ *>(q),
 				static_cast<const T_ *>(k_base), static_cast<const T_ *>(v_base),
 				d_cu_seqlens_, d_seq_ids_, d_pos_, d_table_,
-				current_B_, NH_, NKV_, HS_, W, current_total_, stream);
+				current_B_, NH_, NKV_, HS_, W, current_total_, window_size, stream);
 		});
 	}
 

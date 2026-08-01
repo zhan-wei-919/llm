@@ -27,7 +27,7 @@ class TinyLlamaBlock {
 public:
 	TinyLlamaBlock(LLM &llm, Engine &engine, Tensor *input, int layer)
 	: input_norm_(llm, input, MAX_BATCHED_TOKENS, HIDDEN, RMS_EPS, prefix(layer) + ".input_layernorm")
-	, self_attn_(llm, engine, input_norm_.out(), MAX_BATCHED_TOKENS, HIDDEN, layer, false, false, prefix(layer) + ".self_attn")
+	, self_attn_(llm, engine, input_norm_.out(), MAX_BATCHED_TOKENS, HIDDEN, layer, false, false, -1, prefix(layer) + ".self_attn")
 	, attention_residual_(llm, input, self_attn_.out(), MAX_BATCHED_TOKENS, HIDDEN)
 	, post_attention_norm_(llm, attention_residual_.out(), MAX_BATCHED_TOKENS, HIDDEN, RMS_EPS, prefix(layer) + ".post_attention_layernorm")
 	, mlp_(llm, post_attention_norm_.out(), MAX_BATCHED_TOKENS, HIDDEN, INTERMEDIATE, false, prefix(layer) + ".mlp")

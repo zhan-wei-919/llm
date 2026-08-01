@@ -12,9 +12,10 @@
 template<typename T>
 class Attention : public Module {
 public:
-	Attention(LLM &llm, Engine &engine, Tensor *input, int max_tokens, int hidden_dim, int layer, bool qkv_has_bias, bool o_has_bias, std::string prefix)
+	// 组装融合 QKV、分页 Attention 与输出投影。
+	Attention(LLM &llm, Engine &engine, Tensor *input, int max_tokens, int hidden_dim, int layer, bool qkv_has_bias, bool o_has_bias, int window_size, std::string prefix)
 	: qkv_proj_(llm, engine, input, max_tokens, hidden_dim, layer, qkv_has_bias, prefix)
-	, paged_attention_(llm, engine, qkv_proj_.out(), layer)
+	, paged_attention_(llm, engine, qkv_proj_.out(), layer, window_size)
 	, o_proj_(llm, paged_attention_.out(), max_tokens, engine.qkv_size()[0] * engine.qkv_size()[2], hidden_dim, o_has_bias, prefix + ".o_proj"){}
 
 	Tensor *out() {return o_proj_.out();}

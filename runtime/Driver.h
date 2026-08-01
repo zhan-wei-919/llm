@@ -25,12 +25,13 @@ public:
 		for (Slot &slot : slots_) cudaEventDestroy(slot.ready);
 	}
 
+	// 尽量向 GPU 塞入一个 Prefill batch 和一个 Decode batch 同时回收已经完成的旧 batch
 	Pump pump() {
 		times_ = {};
 		bool launched = false;
 		for (ExecutionPhase phase : {ExecutionPhase::PREFILL, ExecutionPhase::DECODE}) {
 			if (inflight_.size() == slots_.size()) consume_oldest();
-			auto c0 = now();
+			auto c0 = now();	// TODO: 或许未来可以改为条件编译, release不编译这个
 			ScheduledBatch batch = sched_.schedule(phase);
 			times_.sched_us += us_since(c0);
 			if (batch.empty()) continue;

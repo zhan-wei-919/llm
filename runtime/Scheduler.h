@@ -11,11 +11,15 @@
 enum class ExecutionPhase { PREFILL, DECODE };
 enum class RequestPhase { PREFILL, HANDOFF, DECODE, FINISHED };
 
+// KVCache的使用权
 struct KvLease {
-	int executor_id = 0;
-	int slot = -1;
+	int executor_id = 0;	// KV 属于哪张卡或哪个执行器
+	int slot = -1;		// 该执行器的 KV Pool 序列槽
 };
 
+// Prefill 完成后调用 begin(request_id, source)：请求 request_id 的 KV 目前在 source, 请开始交给 Decode 端
+// 之后调度器反复调用 poll(), 拿到已经完成的 HandoffResult
+// 其中 destination 是 Decode 此后应使用的 KV 位置
 struct HandoffResult {
 	int request_id;
 	KvLease destination;
@@ -28,6 +32,7 @@ public:
 	virtual std::vector<HandoffResult> poll() = 0;
 };
 
+// 当前单卡实现：begin() 直接把 {request_id, source} 塞进 ready_；poll() 立刻取出
 class LocalKvHandoff final : public KvHandoff {
 public:
 	void begin(int request_id, KvLease source) override {ready_.push_back({request_id, source});}
@@ -47,7 +52,7 @@ struct Request {
 	int			prompt_len;
 	int			max_new_tokens;
 	RequestPhase		phase = RequestPhase::PREFILL;
-	KvLease		kv;
+	KvLease			kv;
 	int			in_flight = 0;
 	int			cached_len = 0;
 	int			scheduled_len = 0;

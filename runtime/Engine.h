@@ -77,11 +77,11 @@ public:
 	}
 
 	// 融合完成 QKV 投影、Q/K RoPE，并把当前层 K/V 写入 prepare 预先计算的物理位置。
-	void forward_qkv(int layer, const __nv_bfloat16 *input, const __nv_bfloat16 *weight,
-	                 const __nv_bfloat16 *bias, __nv_bfloat16 *q, int K, cudaStream_t stream) {
-		launch_qkv_gemm_bf16(input, weight, bias, q,
-			static_cast<__nv_bfloat16 *>(pool_->k_base(layer)),
-			static_cast<__nv_bfloat16 *>(pool_->v_base(layer)),
+	template<typename T>
+	void forward_qkv(int layer, const T *input, const T *weight, const T *bias, T *q, int K, cudaStream_t stream) {
+		launch_qkv_gemm(input, weight, bias, q,
+			static_cast<T *>(pool_->k_base(layer)),
+			static_cast<T *>(pool_->v_base(layer)),
 			d_positions_, d_kv_dst_, static_cast<const float *>(cos_->ptr),
 			static_cast<const float *>(sin_->ptr),
 			current_total_, K, NH_, NKV_, HS_, stream);

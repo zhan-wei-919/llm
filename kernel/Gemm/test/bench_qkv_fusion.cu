@@ -179,7 +179,7 @@ static void run_shape(const BenchShape &shape, int M, int *flush, int flush_coun
 		launch_scatter_kv(kp0, vp0, k0, v0, table, cu, seq, pos, M, shape.NKV, shape.HS, W, stream);
 	};
 	auto fused = [&] {
-		launch_qkv_gemm_bf16(a, w, nullptr, q1, kp1, vp1, positions, dst, cos_table, sin_table,
+		launch_qkv_gemm<T>(a, w, nullptr, q1, kp1, vp1, positions, dst, cos_table, sin_table,
 			M, shape.K, shape.NH, shape.NKV, shape.HS, stream);
 	};
 

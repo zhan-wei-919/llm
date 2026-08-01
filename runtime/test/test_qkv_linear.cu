@@ -12,10 +12,11 @@ constexpr int NH = 2, NKV = 1, HS = 8;
 constexpr int K = 16, QN = NH * HS, KN = NKV * HS, N = QN + 2 * KN;
 constexpr int MAX_TOKENS = 19, MAX_SEQS = 4, MAX_SEQ_LEN = 64, NUM_BLOCKS = 12;
 
+template<typename T>
 struct Blob {
 	std::string name;
 	std::vector<int> shape;
-	std::vector<__nv_bfloat16> data;
+	std::vector<T> data;
 };
 
 struct ErrorStats {
@@ -32,11 +33,12 @@ struct ErrorStats {
 	}
 };
 
-static std::vector<__nv_bfloat16> make_values(int count, int seed) {
-	std::vector<__nv_bfloat16> values(count);
+template<typename T>
+static std::vector<T> make_values(int count, int seed) {
+	std::vector<T> values(count);
 	for (int i = 0; i < count; ++i) {
 		int x = (i * 17 + seed * 11) % 31 - 15;
-		values[i] = __float2bfloat16(x * 0.0078125f);
+		values[i] = static_cast<T>(x * 0.0078125f);
 	}
 	return values;
 }
@@ -51,13 +53,15 @@ static std::string shape_json(const std::vector<int> &shape) {
 }
 
 // 写入测试专用 safetensors，保持 q/k/v checkpoint 为独立逻辑参数。
-static void write_safetensor(const std::string &path, const std::vector<Blob> &blobs) {
+template<typename T>
+static void write_safetensor(const std::string &path, const std::vector<Blob<T>> &blobs) {
 	std::string header = "{";
 	uint64_t offset = 0;
 	for (size_t i = 0; i < blobs.size(); ++i) {
-		uint64_t end = offset + blobs[i].data.size() * sizeof(__nv_bfloat16);
+		uint64_t end = offset + blobs[i].data.size() * sizeof(T);
 		if (i) header += ",";
-		header += "\"" + blobs[i].name + "\":{\"dtype\":\"BF16\",\"shape\":" +
+		header += "\"" + blobs[i].name + "\":{\"dtype\":\"" +
+			std::string(std::is_same<T, half>::value ? "F16" : "BF16") + "\",\"shape\":" +
 			shape_json(blobs[i].shape) + ",\"data_offsets\":[" +
 			std::to_string(offset) + "," + std::to_string(end) + "]}";
 		offset = end;
@@ -67,9 +71,9 @@ static void write_safetensor(const std::string &path, const std::vector<Blob> &b
 	uint64_t header_size = header.size();
 	for (int i = 0; i < 8; ++i) file.put(static_cast<char>((header_size >> (8 * i)) & 0xff));
 	file.write(header.data(), static_cast<std::streamsize>(header.size()));
-	for (const Blob &blob : blobs)
+	for (const Blob<T> &blob : blobs)
 		file.write(reinterpret_cast<const char *>(blob.data.data()),
-			static_cast<std::streamsize>(blob.data.size() * sizeof(__nv_bfloat16)));
+			static_cast<std::streamsize>(blob.data.size() * sizeof(T)));
 }
 
 static int packed_column(int logical, int head_dim) {
@@ -78,43 +82,43 @@ static int packed_column(int logical, int head_dim) {
 }
 
 // 验证 loader 已把转置后的 Q/K 按 RoPE 对重排，并写入唯一融合存储。
-static void check_packed_parameters(QKVLinear<__nv_bfloat16> &qkv,
-	const std::vector<__nv_bfloat16> &qw, const std::vector<__nv_bfloat16> &kw,
-	const std::vector<__nv_bfloat16> &vw, const std::vector<__nv_bfloat16> &qb,
-	const std::vector<__nv_bfloat16> &kb, const std::vector<__nv_bfloat16> &vb, bool has_bias) {
-	std::vector<__nv_bfloat16> weight(K * N);
+template<typename T>
+static void check_packed_parameters(QKVLinear<T> &qkv,
+	const std::vector<T> &qw, const std::vector<T> &kw, const std::vector<T> &vw,
+	const std::vector<T> &qb, const std::vector<T> &kb, const std::vector<T> &vb, bool has_bias) {
+	std::vector<T> weight(K * N);
 	cudaMemcpy(weight.data(), qkv.weight()->ptr, qkv.weight()->bytes(), cudaMemcpyDeviceToHost);
 	for (int k = 0; k < K; ++k) {
 		for (int d = 0; d < QN; ++d)
-			assert(__bfloat162float(weight[k * N + packed_column(d, HS)]) == __bfloat162float(qw[d * K + k]));
+			assert(static_cast<float>(weight[k * N + packed_column(d, HS)]) == static_cast<float>(qw[d * K + k]));
 		for (int d = 0; d < KN; ++d)
-			assert(__bfloat162float(weight[k * N + QN + packed_column(d, HS)]) == __bfloat162float(kw[d * K + k]));
+			assert(static_cast<float>(weight[k * N + QN + packed_column(d, HS)]) == static_cast<float>(kw[d * K + k]));
 		for (int d = 0; d < KN; ++d)
-			assert(__bfloat162float(weight[k * N + QN + KN + d]) == __bfloat162float(vw[d * K + k]));
+			assert(static_cast<float>(weight[k * N + QN + KN + d]) == static_cast<float>(vw[d * K + k]));
 	}
 	if (!has_bias) return;
-	std::vector<__nv_bfloat16> bias(N);
+	std::vector<T> bias(N);
 	cudaMemcpy(bias.data(), qkv.bias()->ptr, qkv.bias()->bytes(), cudaMemcpyDeviceToHost);
-	for (int d = 0; d < QN; ++d) assert(__bfloat162float(bias[packed_column(d, HS)]) == __bfloat162float(qb[d]));
-	for (int d = 0; d < KN; ++d) assert(__bfloat162float(bias[QN + packed_column(d, HS)]) == __bfloat162float(kb[d]));
-	for (int d = 0; d < KN; ++d) assert(__bfloat162float(bias[QN + KN + d]) == __bfloat162float(vb[d]));
+	for (int d = 0; d < QN; ++d) assert(static_cast<float>(bias[packed_column(d, HS)]) == static_cast<float>(qb[d]));
+	for (int d = 0; d < KN; ++d) assert(static_cast<float>(bias[QN + packed_column(d, HS)]) == static_cast<float>(kb[d]));
+	for (int d = 0; d < KN; ++d) assert(static_cast<float>(bias[QN + KN + d]) == static_cast<float>(vb[d]));
 }
 
-static float projection(const std::vector<__nv_bfloat16> &input, int row,
-	const std::vector<__nv_bfloat16> &weight, const std::vector<__nv_bfloat16> &bias,
-	int out, bool has_bias) {
-	float sum = has_bias ? __bfloat162float(bias[out]) : 0.0f;
+template<typename T>
+static float projection(const std::vector<T> &input, int row, const std::vector<T> &weight,
+	const std::vector<T> &bias, int out, bool has_bias) {
+	float sum = has_bias ? static_cast<float>(bias[out]) : 0.0f;
 	for (int k = 0; k < K; ++k)
-		sum += __bfloat162float(input[row * K + k]) * __bfloat162float(weight[out * K + k]);
-	return __bfloat162float(__float2bfloat16(sum));
+		sum += static_cast<float>(input[row * K + k]) * static_cast<float>(weight[out * K + k]);
+	return static_cast<float>(static_cast<T>(sum));
 }
 
 // 用三份独立投影的 CPU 参考结果检查 Q 输出与分页 KV 写入。
-static void run_case(LLM &llm, Engine &engine, KV_Pool &pool, Tensor *input_tensor, QKVLinear<__nv_bfloat16> &qkv,
+template<typename T>
+static void run_case(LLM &llm, Engine &engine, KV_Pool &pool, Tensor *input_tensor, QKVLinear<T> &qkv,
 	const std::vector<int> &slots, const std::vector<int> &lens, ExecutionPhase phase, int seed,
-	const std::vector<__nv_bfloat16> &qw, const std::vector<__nv_bfloat16> &kw,
-	const std::vector<__nv_bfloat16> &vw, const std::vector<__nv_bfloat16> &qb,
-	const std::vector<__nv_bfloat16> &kb, const std::vector<__nv_bfloat16> &vb,
+	const std::vector<T> &qw, const std::vector<T> &kw, const std::vector<T> &vw,
+	const std::vector<T> &qb, const std::vector<T> &kb, const std::vector<T> &vb,
 	bool has_bias, ErrorStats &stats) {
 	int B = static_cast<int>(slots.size()), M = 0;
 	std::vector<int> starts(B);
@@ -122,8 +126,8 @@ static void run_case(LLM &llm, Engine &engine, KV_Pool &pool, Tensor *input_tens
 		starts[b] = pool.seq_len(slots[b]);
 		M += lens[b];
 	}
-	std::vector<__nv_bfloat16> input = make_values(M * K, seed);
-	cudaMemcpyAsync(input_tensor->ptr, input.data(), input.size() * sizeof(__nv_bfloat16),
+	std::vector<T> input = make_values<T>(M * K, seed);
+	cudaMemcpyAsync(input_tensor->ptr, input.data(), input.size() * sizeof(T),
 		cudaMemcpyHostToDevice, llm.stream());
 	GraphShape shape = engine.prepare(slots.data(), B, lens.data(), llm.stream());
 	assert(shape.batch == B && shape.total_tokens == M);
@@ -137,55 +141,56 @@ static void run_case(LLM &llm, Engine &engine, KV_Pool &pool, Tensor *input_tens
 
 	llm.forward(phase, shape);
 	cudaStreamSynchronize(llm.stream());
-	std::vector<__nv_bfloat16> got_q(M * QN);
-	std::vector<__nv_bfloat16> got_k(NUM_BLOCKS * KV_BLOCK_SIZE * KN);
-	std::vector<__nv_bfloat16> got_v(NUM_BLOCKS * KV_BLOCK_SIZE * KN);
-	cudaMemcpy(got_q.data(), qkv.out()->ptr, got_q.size() * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
-	cudaMemcpy(got_k.data(), pool.k_base(0), got_k.size() * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
-	cudaMemcpy(got_v.data(), pool.v_base(0), got_v.size() * sizeof(__nv_bfloat16), cudaMemcpyDeviceToHost);
+	std::vector<T> got_q(M * QN);
+	std::vector<T> got_k(NUM_BLOCKS * KV_BLOCK_SIZE * KN);
+	std::vector<T> got_v(NUM_BLOCKS * KV_BLOCK_SIZE * KN);
+	cudaMemcpy(got_q.data(), qkv.out()->ptr, got_q.size() * sizeof(T), cudaMemcpyDeviceToHost);
+	cudaMemcpy(got_k.data(), pool.k_base(0), got_k.size() * sizeof(T), cudaMemcpyDeviceToHost);
+	cudaMemcpy(got_v.data(), pool.v_base(0), got_v.size() * sizeof(T), cudaMemcpyDeviceToHost);
 
 	for (int t = 0; t < M; ++t) {
 		for (int h = 0; h < NH; ++h) {
 			for (int i = 0; i < HS / 2; ++i) {
 				int d0 = h * HS + i, d1 = d0 + HS / 2;
-				float x0 = projection(input, t, qw, qb, d0, has_bias);
-				float x1 = projection(input, t, qw, qb, d1, has_bias);
+				float x0 = projection<T>(input, t, qw, qb, d0, has_bias);
+				float x1 = projection<T>(input, t, qw, qb, d1, has_bias);
 				float angle = positions[t] * std::pow(10000.0f, -2.0f * i / HS);
 				float c = std::cos(angle), s = std::sin(angle);
-				float want0 = __bfloat162float(__float2bfloat16(x0 * c - x1 * s));
-				float want1 = __bfloat162float(__float2bfloat16(x0 * s + x1 * c));
-				stats.add(__bfloat162float(got_q[t * QN + d0]), want0);
-				stats.add(__bfloat162float(got_q[t * QN + d1]), want1);
+				float want0 = static_cast<float>(static_cast<T>(x0 * c - x1 * s));
+				float want1 = static_cast<float>(static_cast<T>(x0 * s + x1 * c));
+				stats.add(static_cast<float>(got_q[t * QN + d0]), want0);
+				stats.add(static_cast<float>(got_q[t * QN + d1]), want1);
 			}
 		}
 		int target = destinations[t] * KN;
 		for (int h = 0; h < NKV; ++h) {
 			for (int i = 0; i < HS / 2; ++i) {
 				int d0 = h * HS + i, d1 = d0 + HS / 2;
-				float x0 = projection(input, t, kw, kb, d0, has_bias);
-				float x1 = projection(input, t, kw, kb, d1, has_bias);
+				float x0 = projection<T>(input, t, kw, kb, d0, has_bias);
+				float x1 = projection<T>(input, t, kw, kb, d1, has_bias);
 				float angle = positions[t] * std::pow(10000.0f, -2.0f * i / HS);
 				float c = std::cos(angle), s = std::sin(angle);
-				float want0 = __bfloat162float(__float2bfloat16(x0 * c - x1 * s));
-				float want1 = __bfloat162float(__float2bfloat16(x0 * s + x1 * c));
-				stats.add(__bfloat162float(got_k[target + d0]), want0);
-				stats.add(__bfloat162float(got_k[target + d1]), want1);
+				float want0 = static_cast<float>(static_cast<T>(x0 * c - x1 * s));
+				float want1 = static_cast<float>(static_cast<T>(x0 * s + x1 * c));
+				stats.add(static_cast<float>(got_k[target + d0]), want0);
+				stats.add(static_cast<float>(got_k[target + d1]), want1);
 			}
 		}
 		for (int d = 0; d < KN; ++d)
-			stats.add(__bfloat162float(got_v[target + d]), projection(input, t, vw, vb, d, has_bias));
+			stats.add(static_cast<float>(got_v[target + d]), projection<T>(input, t, vw, vb, d, has_bias));
 	}
 }
 
 // 分别运行 bias/no-bias，覆盖小 M、Tensor Core 大 M 和同形状 Graph replay。
+template<typename T>
 static void run_suite(bool has_bias, ErrorStats &stats) {
-	std::vector<__nv_bfloat16> qw = make_values(QN * K, 1);
-	std::vector<__nv_bfloat16> kw = make_values(KN * K, 2);
-	std::vector<__nv_bfloat16> vw = make_values(KN * K, 3);
-	std::vector<__nv_bfloat16> qb = make_values(QN, 4);
-	std::vector<__nv_bfloat16> kb = make_values(KN, 5);
-	std::vector<__nv_bfloat16> vb = make_values(KN, 6);
-	std::vector<Blob> blobs = {
+	std::vector<T> qw = make_values<T>(QN * K, 1);
+	std::vector<T> kw = make_values<T>(KN * K, 2);
+	std::vector<T> vw = make_values<T>(KN * K, 3);
+	std::vector<T> qb = make_values<T>(QN, 4);
+	std::vector<T> kb = make_values<T>(KN, 5);
+	std::vector<T> vb = make_values<T>(KN, 6);
+	std::vector<Blob<T>> blobs = {
 		{"attn.q_proj.weight", {QN, K}, qw},
 		{"attn.k_proj.weight", {KN, K}, kw},
 		{"attn.v_proj.weight", {KN, K}, vw}
@@ -195,25 +200,26 @@ static void run_suite(bool has_bias, ErrorStats &stats) {
 		blobs.push_back({"attn.k_proj.bias", {KN}, kb});
 		blobs.push_back({"attn.v_proj.bias", {KN}, vb});
 	}
-	std::string path = has_bias ? "/tmp/test_qkv_bias.safetensors" : "/tmp/test_qkv_no_bias.safetensors";
+	const char *type = std::is_same<T, half>::value ? "f16" : "bf16";
+	std::string path = std::string("/tmp/test_qkv_") + type + (has_bias ? "_bias.safetensors" : "_no_bias.safetensors");
 	write_safetensor(path, blobs);
 
-	size_t kv_bytes = (size_t)NUM_BLOCKS * KV_BLOCK_SIZE * KN * sizeof(__nv_bfloat16);
+	size_t kv_bytes = (size_t)NUM_BLOCKS * KV_BLOCK_SIZE * KN * sizeof(T);
 	void *k_base, *v_base;
 	cudaMalloc(&k_base, kv_bytes);
 	cudaMalloc(&v_base, kv_bytes);
 	{
 		LLM llm(8);
 		Engine engine(llm.arena(), NH, NKV, HS, MAX_SEQS, MAX_SEQ_LEN);
-		Tensor *input = llm.arena().alloc({MAX_TOKENS, K}, Dtype::BF16);
-		QKVLinear<__nv_bfloat16> qkv(llm, engine, input, MAX_TOKENS, K, 0, has_bias, "attn");
+		Tensor *input = llm.arena().alloc({MAX_TOKENS, K}, dtype_of<T>::value);
+		QKVLinear<T> qkv(llm, engine, input, MAX_TOKENS, K, 0, has_bias, "attn");
 		assert(llm.parameters().size() == (has_bias ? 6 : 3));
 		assert(llm.parameter_storages().size() == (has_bias ? 2 : 1));
 		assert(llm.parameters().at("attn.q_proj.weight").tensor == qkv.weight());
 		assert(llm.parameters().at("attn.k_proj.weight").tensor == qkv.weight());
 		assert(llm.parameters().at("attn.v_proj.weight").tensor == qkv.weight());
 		llm.finalize();
-		KV_Pool pool(k_base, v_base, Dtype::BF16, KN, kv_bytes, 1, MAX_SEQS, MAX_SEQ_LEN);
+		KV_Pool pool(k_base, v_base, dtype_of<T>::value, KN, kv_bytes, 1, MAX_SEQS, MAX_SEQ_LEN);
 		engine.bind_pool(&pool);
 		engine.init_rope(llm.stream());
 		llm.load_safetensor(path, [](const std::string &name) {
@@ -248,11 +254,14 @@ static void run_suite(bool has_bias, ErrorStats &stats) {
 }
 
 int main() {
-	ErrorStats stats;
-	run_suite(false, stats);
-	run_suite(true, stats);
-	assert(stats.above == 0);
-	std::printf("test_qkv_linear PASS max_error=%.7f mean_error=%.7f above_2e-2=%d count=%d\n",
-		stats.max_error, stats.error_sum / stats.count, stats.above, stats.count);
+	ErrorStats bf16, f16;
+	run_suite<__nv_bfloat16>(false, bf16);
+	run_suite<__nv_bfloat16>(true, bf16);
+	run_suite<half>(false, f16);
+	run_suite<half>(true, f16);
+	assert(bf16.above == 0 && f16.above == 0);
+	std::printf("test_qkv_linear PASS BF16 max=%.7f mean=%.7f count=%d; F16 max=%.7f mean=%.7f count=%d\n",
+		bf16.max_error, bf16.error_sum / bf16.count, bf16.count,
+		f16.max_error, f16.error_sum / f16.count, f16.count);
 	return 0;
 }

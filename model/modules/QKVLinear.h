@@ -1,5 +1,6 @@
 #pragma once
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -14,7 +15,8 @@ public:
 	QKVLinear(LLM &llm, Engine &engine, Tensor *input, int max_tokens, int in_channel,
 	          int layer, bool has_bias, const std::string &prefix)
 	: engine_(engine), input_(input), in_channel_(in_channel), layer_(layer), has_bias_(has_bias) {
-		static_assert(std::is_same<T, __nv_bfloat16>::value, "QKVLinear only supports BF16");
+		static_assert(std::is_same<T, __nv_bfloat16>::value || std::is_same<T, half>::value,
+		              "QKVLinear only supports F16/BF16");
 		std::vector<int> dims = engine_.qkv_size();
 		int NH = dims[0], NKV = dims[1], HS = dims[2];
 		q_channel_ = NH * HS;
@@ -36,10 +38,10 @@ public:
 
 	// 执行融合投影；返回旋转后的 Q，并把旋转后的 K 与 V 写入当前层 KV Pool。
 	void forward(const GraphShape &, cudaStream_t stream) {
-		engine_.forward_qkv(layer_, static_cast<const __nv_bfloat16 *>(input_->ptr),
-			static_cast<const __nv_bfloat16 *>(weight_->ptr),
-			has_bias_ ? static_cast<const __nv_bfloat16 *>(bias_->ptr) : nullptr,
-			static_cast<__nv_bfloat16 *>(out_->ptr), in_channel_, stream);
+		engine_.forward_qkv<T>(layer_, static_cast<const T *>(input_->ptr),
+			static_cast<const T *>(weight_->ptr),
+			has_bias_ ? static_cast<const T *>(bias_->ptr) : nullptr,
+			static_cast<T *>(out_->ptr), in_channel_, stream);
 	}
 
 	Tensor *out() {return out_;}
